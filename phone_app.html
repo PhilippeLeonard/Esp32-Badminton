@@ -130,6 +130,7 @@ const store = {
 
 let base = store.get("esp32ip") || location.host || "";
 let running = false;
+let lastOkMs = 0;          // derniere reponse reellement recue
 let S = {};
 let burst = null;          // { w, h, frames: [Uint8Array] }
 let playTimer = null;
@@ -138,9 +139,12 @@ let lastEvents = -1;
 $("ip").value = base;
 /* Servie depuis la carte, la page se parle a elle-meme : pas d'adresse
    a taper, pas de CORS. Ouverte depuis un fichier, le champ sert. */
+/* Servie par la carte : l'adresse est connue, le champ ne sert a rien.
+   Le bouton reste, lui : c'est devenu le temoin de connexion. */
 if (location.protocol.startsWith("http") && location.host) {
   base = location.host;
-  $("connBar").style.display = "none";
+  $("ip").style.display = "none";
+  $("conn").style.flex = "1";
 }
 
 const host = () => base.replace(/^https?:\/\//, "").replace(/\/.*$/, "");
@@ -168,12 +172,25 @@ function drawRuns(bytes, w, h) {
 }
 
 /* ---------------- etat, interroge plusieurs fois par seconde ---------------- */
+/* Rouge = la carte repond et les donnees arrivent. Bleu = rien ne vient.
+   L'etat suit la DERNIERE reponse recue, pas le clic : un cable debranche
+   ou un hotspot qui lache se voit tout de suite, sans avoir a lire le
+   texte d'erreur. */
+function setConnected(ok) {
+  const b = $("conn");
+  b.className = ok ? "rec" : "on";
+  b.textContent = ok ? "Connecte" : "Connecter";
+}
+
 async function poll() {
   if (!running) return;
   try {
     S = await (await fetch(url("/motion"), { cache: "no-store" })).json();
+    lastOkMs = Date.now();
+    setConnected(true);
   } catch (e) {
     $("info").textContent = "pas de reponse de " + host();
+    setConnected(false);
     return;
   }
 
@@ -297,6 +314,7 @@ $("conn").onclick = () => {
 function start() {
   if (!base) return;
   running = true;
+  setConnected(false);
   poll(); files();
 }
 
@@ -355,6 +373,12 @@ async function files() {
     }
   });
 }
+
+/* poll() peut rester bloque sans lever d'erreur : on surveille aussi
+   l'age de la derniere reponse. */
+setInterval(() => {
+  if (running && Date.now() - lastOkMs > 2000) setConnected(false);
+}, 1000);
 
 setInterval(poll, 350);
 start();
