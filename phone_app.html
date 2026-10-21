@@ -16,6 +16,7 @@
   h1{font-size:15px;margin:16px 0 6px;color:var(--muted);font-weight:600;
      text-transform:uppercase;letter-spacing:.05em}
   canvas{width:100%;border-radius:10px;background:#000;display:block;aspect-ratio:4/3}
+  #refImg{width:100%;border-radius:10px;display:block;border:1px solid var(--line)}
   button{font-size:16px;padding:13px 14px;border:0;border-radius:9px;color:#fff;
          margin:5px 0;width:100%;font-weight:600}
   button:disabled{opacity:.35}
@@ -91,6 +92,11 @@
   <button id="look" class="sec">Voir le masque</button>
 </div>
 
+<div id="refWrap" style="display:none">
+  <div class="st">Image de reference &mdash; tout est compare a celle-ci</div>
+  <img id="refImg" alt="reference">
+</div>
+
 <h1>Enregistrement brut</h1>
 <div class="st" id="rstat">arrete</div>
 <button id="rec" class="idle">Enregistrer la video brute</button>
@@ -135,6 +141,7 @@ let S = {};
 let burst = null;          // { w, h, frames: [Uint8Array] }
 let playTimer = null;
 let lastEvents = -1;
+let refShown = false;      // la reference n'est rechargee qu'au changement
 
 $("ip").value = base;
 /* Servie depuis la carte, la page se parle a elle-meme : pas d'adresse
@@ -225,6 +232,17 @@ async function poll() {
     + (S.lock ? " · expo verrouillee" : "")
     + " · " + S.events + " evenement(s)";
   $("err").textContent = S.ref ? "" : "Prends une reference, scene au repos.";
+
+  /* Une seule image, chargee une seule fois : voir sur quoi la detection
+     se base explique la plupart des comportements etranges. */
+  if (S.ref && !refShown) {
+    refShown = true;
+    $("refImg").src = url("/refimg?t=" + Date.now());
+    $("refWrap").style.display = "";
+  } else if (!S.ref && refShown) {
+    refShown = false;
+    $("refWrap").style.display = "none";
+  }
 
   /* Enregistrement brut : tourne en parallele de la detection, sur la
      meme capture. Sert a rejouer l'algorithme hors ligne. */
@@ -322,6 +340,7 @@ $("ref").onclick = async () => {
   $("ref").textContent = "mesure de l'exposition...";
   try { await fetch(url("/reference")); } catch (e) {}
   $("ref").textContent = "Prendre la reference";
+  refShown = false;                 // forcer le rechargement de la vignette
   poll();
 };
 

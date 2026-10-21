@@ -832,6 +832,27 @@ static void handleSnapshot() {
   free(jpg);
 }
 
+/* The stored reference, as a JPEG. Asked for once after it is taken, so
+ * you can see what the comparison is actually based on - a reference
+ * caught mid-exposure or with someone still in frame explains far more
+ * odd behaviour than any threshold does. */
+static void handleRefImg() {
+  if (!haveRef) { cors(); server.send(409, "text/plain", "no reference"); return; }
+  uint8_t* jpg = nullptr;
+  size_t   len = 0;
+  if (!fmt2jpg(refBuf, grayLen, grayW, grayH, PIXFORMAT_GRAYSCALE,
+               PREVIEW_QUALITY, &jpg, &len)) {
+    server.send(503, "text/plain", "encode failed");
+    return;
+  }
+  cors();
+  server.sendHeader("Cache-Control", "no-store");
+  server.setContentLength(len);
+  server.send(200, "image/jpeg", "");
+  server.sendContent((const char*)jpg, len);
+  free(jpg);
+}
+
 /* The live mask as run-length, for aiming and tuning the threshold.
  * Asked for on demand, never pushed. */
 static void handleMask() {
@@ -980,6 +1001,7 @@ void setup() {
   server.on("/mask",      handleMask);
   server.on("/snapshot",  handleSnapshot);
   server.on("/reference", handleReference);
+  server.on("/refimg",    handleRefImg);
   server.on("/threshold", handleThreshold);
   server.on("/trigger",   handleTrigger);
   server.on("/calm",      handleCalm);
