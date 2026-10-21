@@ -50,9 +50,15 @@ static const char APP_PAGE[] PROGMEM = R"HTML(<!doctype html>
   a{color:#5dade2;margin-right:12px}
   .conn{display:flex;gap:8px;align-items:center;background:var(--panel);
         padding:8px;border-radius:9px;margin-bottom:10px}
+  .ver{position:fixed;top:6px;right:8px;font-size:11px;color:var(--muted);
+       background:rgba(16,18,20,.85);padding:3px 7px;border-radius:6px;
+       font-variant-numeric:tabular-nums;z-index:10}
+  .ver.bad{color:#e67e22}
 </style>
 </head>
 <body>
+
+<div class="ver" id="ver">v?</div>
 
 <div class="conn" id="connBar">
   <input id="ip" type="text" inputmode="url" placeholder="192.168.4.1" autocomplete="off">
@@ -111,8 +117,14 @@ static const char APP_PAGE[] PROGMEM = R"HTML(<!doctype html>
  *  et les tient pretes ; cette page va alors les chercher d'un coup.
  * =================================================================== */
 
+/* Version de cette page. Le firmware annonce la sienne dans /motion :
+   si les deux different, la page affichee ne vient pas du firmware qui
+   tourne (vieux cache, ou make_page.py pas relance avant de flasher). */
+const APP_VERSION = "1.1.0";
+
 const $ = i => document.getElementById(i);
 const cv = $("cv"), ctx = cv.getContext("2d");
+$("ver").textContent = "v" + APP_VERSION;
 
 const store = {
   get(k)   { try { return localStorage.getItem(k) || ""; } catch (e) { return ""; } },
@@ -185,6 +197,14 @@ async function poll() {
     st.innerHTML = '<span class="tag t-ready">rafale prete</span>';
   else
     st.innerHTML = '<span class="tag t-idle">en veille</span>';
+
+  if (S.ver && S.ver !== APP_VERSION) {
+    $("ver").textContent = "page v" + APP_VERSION + " / carte v" + S.ver;
+    $("ver").className = "ver bad";
+  } else {
+    $("ver").textContent = "v" + APP_VERSION;
+    $("ver").className = "ver";
+  }
 
   $("info").textContent = S.w + "x" + S.h
     + (S.ref ? " · reference ok" : " · PAS DE REFERENCE")

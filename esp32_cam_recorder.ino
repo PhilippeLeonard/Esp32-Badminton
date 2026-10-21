@@ -31,6 +31,11 @@
 #include "SD_MMC.h"
 #include "app_page.h"       // generated from phone_app.html by make_page.py
 
+/* Version announced in /motion. The page carries its own copy and says
+ * so when the two differ: that means the page being viewed did not come
+ * from the firmware that is running. */
+#define FW_VERSION "1.1.0"
+
 /* ------------------------- 1. Network ------------------------------- */
 static const char* WIFI_SSID = "Philphone";   // 2.4 GHz hotspot
 static const char* WIFI_PASS = "12345678";
@@ -711,7 +716,7 @@ static void handleRoot() { server.send_P(200, "text/html", APP_PAGE); }
 static void handleMotion() {
   char j[256];
   snprintf(j, sizeof(j),
-           "{\"pct\":%.2f,\"refpct\":%.2f,\"move\":%.2f,\"calm\":%.2f,\"minms\":%u,\"thr\":%u,"
+           "{\"ver\":\"" FW_VERSION "\",\"pct\":%.2f,\"refpct\":%.2f,\"move\":%.2f,\"calm\":%.2f,\"minms\":%u,\"thr\":%u,"
            "\"ref\":%s,\"lock\":%s,\"state\":%u,\"active\":%u,\"n\":%u,"
            "\"events\":%u,\"sd\":%s,\"rec\":%s,\"recn\":%u,\"recfile\":\"%s\",\"w\":%u,\"h\":%u,\"file\":\"%s\"}",
            lastPct, refPct, movePct, calmPct, (unsigned)minActiveMs, (unsigned)threshold,
