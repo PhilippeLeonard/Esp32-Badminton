@@ -10,6 +10,11 @@ import sys
 here = pathlib.Path(__file__).parent
 html = (here / "phone_app.html").read_text(encoding="utf-8")
 
+# The Arduino IDE only opens a sketch that sits in a folder named after
+# it, so the .ino lives in esp32_cam_recorder/ and the generated header
+# has to land beside it - not next to this script.
+sketch = here / "esp32_cam_recorder"
+
 # The page goes inside a C++ raw string literal, so the only sequence that
 # matters is its terminator.
 if ')HTML"' in html:
@@ -20,5 +25,5 @@ out = (
     "#pragma once\n\n"
     'static const char APP_PAGE[] PROGMEM = R"HTML(' + html + ')HTML";\n'
 )
-(here / "app_page.h").write_text(out, encoding="utf-8")
-print(f"app_page.h written, {len(html)} bytes of HTML")
+(sketch / "app_page.h").write_text(out, encoding="utf-8")
+print(f"{sketch.name}/app_page.h written, {len(html)} bytes of HTML")
