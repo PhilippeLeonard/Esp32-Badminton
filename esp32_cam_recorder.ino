@@ -65,6 +65,7 @@ static const char* AP_PASS = "camera123";     // at least 8 characters
 #define MOVE_PERCENT      3.0f            // % of changed pixels that counts as movement
 #define CALM_PERCENT      0.8f            // % below which the scene is considered settled
 #define MIN_ACTIVE_MS     5000            // movement must last at least this long
+#define PCT_AVERAGE       3               // measurements averaged into the figure used
 #define CALM_CYCLES       8               // consecutive calm cycles that close an event
 #define REARM_CYCLES      10              // calm cycles before a new event may start
 
@@ -132,7 +133,11 @@ static uint8_t  threshold      = MOTION_THRESHOLD;
 static float    movePct        = MOVE_PERCENT;
 static float    calmPct        = CALM_PERCENT;
 static uint32_t minActiveMs    = MIN_ACTIVE_MS;
-static float    lastPct        = 0.0f;   // inter-frame movement
+static float    lastPct        = 0.0f;   // inter-frame movement, smoothed
+static float    rawPct         = 0.0f;   // the same figure, unsmoothed
+static float    pctHist[PCT_AVERAGE];    // the last few measurements
+static uint8_t  pctCount       = 0;
+static uint8_t  pctIndex       = 0;
 static float    refPct         = 0.0f;   // difference from the reference
 static uint32_t nextMotionMs   = 0;
 
@@ -356,6 +361,7 @@ static bool captureReference() {
   free(acc);
 
   haveRef   = true;
+  pctCount  = pctIndex = 0;           // the average must not carry over
   evtState  = EVT_WAITING;
   rearmLeft = 0;
   ringCount = ringPos = 0;
@@ -649,7 +655,19 @@ static void motionTick() {
   if (!haveRef) { esp_camera_fb_return(fb); return; }
 
   recordRaw(fb);                      // same grab feeds the recording
-  lastPct = interFrameMotion(fb);     // drives the state machine
+
+  /* Rolling average over the last few measurements. Frame-to-frame
+   * movement is naturally spiky - a shuttle crossing the frame reads
+   * 10, 20, 0, 10, 30 - and a single stray low reading in the middle of
+   * real movement was enough to start closing the event. Averaging costs
+   * nothing and removes that whole class of false ending. */
+  rawPct = interFrameMotion(fb);
+  pctHist[pctIndex] = rawPct;
+  pctIndex = (pctIndex + 1) % PCT_AVERAGE;
+  if (pctCount < PCT_AVERAGE) pctCount++;
+  float sum = 0.0f;
+  for (uint8_t i = 0; i < pctCount; i++) sum += pctHist[i];
+  lastPct = sum / pctCount;           // drives the state machine
   refPct  = buildMask(fb);            // the mask, for the on-demand view
 
   switch (evtState) {
@@ -716,10 +734,10 @@ static void handleRoot() { server.send_P(200, "text/html", APP_PAGE); }
 static void handleMotion() {
   char j[256];
   snprintf(j, sizeof(j),
-           "{\"ver\":\"" FW_VERSION "\",\"pct\":%.2f,\"refpct\":%.2f,\"move\":%.2f,\"calm\":%.2f,\"minms\":%u,\"thr\":%u,"
+           "{\"ver\":\"" FW_VERSION "\",\"pct\":%.2f,\"rawpct\":%.2f,\"refpct\":%.2f,\"move\":%.2f,\"calm\":%.2f,\"minms\":%u,\"thr\":%u,"
            "\"ref\":%s,\"lock\":%s,\"state\":%u,\"active\":%u,\"n\":%u,"
            "\"events\":%u,\"sd\":%s,\"rec\":%s,\"recn\":%u,\"recfile\":\"%s\",\"w\":%u,\"h\":%u,\"file\":\"%s\"}",
-           lastPct, refPct, movePct, calmPct, (unsigned)minActiveMs, (unsigned)threshold,
+           lastPct, rawPct, refPct, movePct, calmPct, (unsigned)minActiveMs, (unsigned)threshold,
            haveRef ? "true" : "false",
            exposureLocked ? "true" : "false",
            (unsigned)evtState,

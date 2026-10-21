@@ -66,7 +66,7 @@
 <canvas id="cv" width="320" height="240"></canvas>
 <div class="st" id="info">non connecte</div>
 
-<h1>Mouvement (entre images)</h1>
+<h1>Mouvement (entre images, moyenne de 3)</h1>
 <div class="big" id="pct">--</div>
 <div class="st" id="refpct">&nbsp;</div>
 <div class="bar">
@@ -204,7 +204,10 @@ async function poll() {
   /* pct = difference avec l'image precedente, c'est elle qui declenche.
      refpct = difference avec la reference, c'est ce que montre le masque. */
   $("pct").textContent = S.pct.toFixed(2) + " %";
-  $("refpct").textContent = "vs reference : " + (S.refpct ?? 0).toFixed(2) + " %";
+  /* Le gros chiffre est la moyenne : c'est elle qui pilote la machine a
+     etats. La mesure brute est rappelee a cote pour voir l'ecart. */
+  $("refpct").textContent = "brut " + (S.rawpct ?? 0).toFixed(2) + " %"
+    + "  ·  vs reference " + (S.refpct ?? 0).toFixed(2) + " %";
   $("fill").style.width = Math.min(100, S.pct * 3) + "%";
   $("mark").style.left  = Math.min(100, S.move * 3) + "%";
   $("fill").style.background = S.pct >= S.move ? "var(--stop)" : "var(--accent)";
