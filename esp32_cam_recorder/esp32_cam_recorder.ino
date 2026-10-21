@@ -1053,8 +1053,7 @@ void loop() {
       staTries = 0;
     } else if (st != WL_IDLE_STATUS && staTries < STA_MAX_TRY) {
       staTries++;
-      Serial.printf("[WIFI] tentative %u/%u vers \"%s\"
-", staTries, STA_MAX_TRY, WIFI_SSID);
+      Serial.printf("[WIFI] tentative %u/%u vers %s\n", staTries, STA_MAX_TRY, WIFI_SSID);
       WiFi.disconnect(false);
       WiFi.begin(WIFI_SSID, WIFI_PASS);
     } else if (staTries >= STA_MAX_TRY) {
