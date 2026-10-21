@@ -1,0 +1,14 @@
+# Sorties de compilation Arduino
+build/
+*.elf
+*.bin
+*.hex
+
+# Projet Android de l'APK : conserve sur le disque, hors depot tant que
+# l'interface web sert de reference. Supprimer cette ligne pour le versionner.
+android-app/
+
+# Enregistrements recuperes depuis la carte SD
+*.gray
+*.avi
+*.apk
