@@ -46,6 +46,8 @@ static const char* HOSTNAME  = "esp32cam";
  * latency - out of the path. AP_ONLY skips the hotspot entirely. */
 #define AP_ENABLED   1
 #define AP_ONLY      0
+#define STA_RETRY_MS 60000   // intervalle entre deux tentatives de hotspot
+#define STA_MAX_TRY  5       // au-dela, on abandonne et on laisse l'AP tranquille
 static const char* AP_SSID = "ESP32-CAM";
 static const char* AP_PASS = "camera123";     // at least 8 characters
 
@@ -1036,12 +1038,30 @@ void loop() {
   server.handleClient();
   motionTick();
 
-  static uint32_t lastWifiCheck = 0;
-  if (millis() - lastWifiCheck > 10000) {
-    lastWifiCheck = millis();
 #if !AP_ONLY
-    if (WiFi.status() != WL_CONNECTED) WiFi.reconnect();
-    else esp_wifi_set_ps(WIFI_PS_NONE);   // a reassociation restores the default
-#endif
+  /* Reessayer toutes les 10 s etait destructeur : chaque tentative fait
+     scanner la radio, partagee avec l'AP, donc l'AP et le serveur web
+     etaient perturbes en permanence. On espace, on ne relance jamais une
+     tentative deja en cours, et on abandonne apres quelques echecs. */
+  static uint32_t lastWifiCheck = 0;
+  static uint8_t  staTries = 0;
+  if (millis() - lastWifiCheck > STA_RETRY_MS) {
+    lastWifiCheck = millis();
+    const wl_status_t st = WiFi.status();
+    if (st == WL_CONNECTED) {
+      esp_wifi_set_ps(WIFI_PS_NONE);
+      staTries = 0;
+    } else if (st != WL_IDLE_STATUS && staTries < STA_MAX_TRY) {
+      staTries++;
+      Serial.printf("[WIFI] tentative %u/%u vers \"%s\"
+", staTries, STA_MAX_TRY, WIFI_SSID);
+      WiFi.disconnect(false);
+      WiFi.begin(WIFI_SSID, WIFI_PASS);
+    } else if (staTries >= STA_MAX_TRY) {
+      staTries = STA_MAX_TRY + 1;
+      WiFi.disconnect(true);
+      Serial.println("[WIFI] hotspot injoignable, station arretee - l'AP reste disponible");
+    }
   }
+#endif
 }
