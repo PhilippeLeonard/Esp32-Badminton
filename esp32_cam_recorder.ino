@@ -67,6 +67,7 @@ static const char* AP_PASS = "camera123";     // at least 8 characters
 #define BURST_FRAMES      20              // frames kept per event
 #define BURST_FPS         10
 #define BURST_FRAME_MAX   24576           // PSRAM reserved per burst frame
+#define BURST_QUALITY     12              // JPEG quality of the stored frames
 
 /* ------------------------- 4. Camera pins --------------------------- */
 /* Freenove ESP32-WROVER CAM (same map as the WROVER-KIT OV2640 board). */
@@ -89,7 +90,16 @@ static const char* AP_PASS = "camera123";     // at least 8 characters
 #define XCLK_FREQ_HZ     20000000
 #define PREVIEW_QUALITY  12               // JPEG quality for /snapshot only
 
-/* ------------------------- 5. SD card ------------------------------- */
+/* ------------------------- 5. Raw recording -------------------------- *
+ * A continuous dump of exactly what the sensor produces: 8-bit grayscale,
+ * no codec at all. The point is to replay the detection offline on real
+ * footage and get the SAME numbers as live - a JPEG would quietly change
+ * pixel values and move every threshold. Costs w*h bytes per frame, so
+ * QVGA at 10 fps is 768 kB/s: roughly 20 minutes per gigabyte.          */
+#define REC_FPS           10
+static const char REC_MAGIC[4] = { 'E', 'S', 'P', 'G' };
+
+/* ------------------------- 6. SD card ------------------------------- */
 /* SDMMC pins are IO-MUX fixed on the classic ESP32: CLK 14, CMD 15, D0 2.
  * 1-bit mode frees GPIO4, which the Freenove board shares with its LED. */
 #define SD_ONE_BIT_MODE   true
@@ -103,6 +113,8 @@ WebServer server(80);
 static uint8_t*  refBuf   = nullptr;   // the reference still
 static uint8_t*  maskBuf  = nullptr;   // working mask, 0x00 or 0xFF
 static uint8_t*  workBuf  = nullptr;   // denoise scratch
+static uint8_t*  prevBuf  = nullptr;   // previous frame, for inter-frame motion
+static bool      havePrev = false;
 static uint8_t*  rleBuf   = nullptr;   // encoder output
 static size_t    rleCap   = 0;
 static size_t    grayLen  = 0;
@@ -115,7 +127,8 @@ static uint8_t  threshold      = MOTION_THRESHOLD;
 static float    movePct        = MOVE_PERCENT;
 static float    calmPct        = CALM_PERCENT;
 static uint32_t minActiveMs    = MIN_ACTIVE_MS;
-static float    lastPct        = 0.0f;
+static float    lastPct        = 0.0f;   // inter-frame movement
+static float    refPct         = 0.0f;   // difference from the reference
 static uint32_t nextMotionMs   = 0;
 
 /* --- event state machine ---
@@ -142,6 +155,13 @@ static char       burstFile[32] = {0};
 static bool     sdReady  = false;
 static String   lastError = "";
 
+/* --- raw recording --- */
+static File     recFile;
+static bool     recOn     = false;
+static uint32_t recFrames = 0;
+static uint32_t recNextMs = 0;
+static char     recPath[32] = {0};
+
 /* ---------------------- little-endian helpers ------------------------ */
 static inline void w32(uint8_t* p, uint32_t v) {
   p[0] = v; p[1] = v >> 8; p[2] = v >> 16; p[3] = v >> 24;
@@ -149,11 +169,10 @@ static inline void w32(uint8_t* p, uint32_t v) {
 static inline void w16(uint8_t* p, uint16_t v) { p[0] = v; p[1] = v >> 8; }
 static inline void tag(uint8_t* p, const char* s) { memcpy(p, s, 4); }
 
-/* ------------------------- AVI (MS-RLE, lossless) -------------------- *
- * Every recording here is a two-colour mask, so the file uses BI_RLE8
- * with a two-entry palette: run-length coded, lossless, and far smaller
- * than MJPEG would be. The header is a fixed 232 bytes.                 */
-static const uint32_t AVI_HEADER_BYTES = 232;
+/* ------------------------- AVI (MJPEG) ------------------------------- *
+ * The burst holds real camera frames, already JPEG encoded, so they go
+ * into the file untouched. Header is a fixed 224 bytes.                 */
+static const uint32_t AVI_HEADER_BYTES = 224;
 
 static void buildAviHeader(uint8_t* h, uint16_t w, uint16_t ht,
                            uint32_t fps, uint32_t frames,
@@ -163,8 +182,8 @@ static void buildAviHeader(uint8_t* h, uint16_t w, uint16_t ht,
   const uint32_t usPerFrame = 1000000UL / fps;
   const uint32_t idxBytes   = 16UL * frames;
 
-  tag(h + 0,  "RIFF"); w32(h + 4,  224 + movi + 8 + idxBytes); tag(h + 8, "AVI ");
-  tag(h + 12, "LIST"); w32(h + 16, 200);                       tag(h + 20, "hdrl");
+  tag(h + 0,  "RIFF"); w32(h + 4,  216 + movi + 8 + idxBytes); tag(h + 8, "AVI ");
+  tag(h + 12, "LIST"); w32(h + 16, 192);                       tag(h + 20, "hdrl");
 
   tag(h + 24, "avih"); w32(h + 28, 56);
   w32(h + 32, usPerFrame);        // dwMicroSecPerFrame
@@ -176,11 +195,11 @@ static void buildAviHeader(uint8_t* h, uint16_t w, uint16_t ht,
   w32(h + 64, w);
   w32(h + 68, ht);
 
-  tag(h + 88,  "LIST"); w32(h + 92, 124); tag(h + 96, "strl");
+  tag(h + 88,  "LIST"); w32(h + 92, 116); tag(h + 96, "strl");
 
   tag(h + 100, "strh"); w32(h + 104, 56);
   tag(h + 108, "vids");
-  tag(h + 112, "MRLE");           // fccHandler
+  tag(h + 112, "MJPG");           // fccHandler
   w32(h + 128, 1);                // dwScale
   w32(h + 132, fps);              // dwRate
   w32(h + 140, frames);           // dwLength
@@ -188,20 +207,16 @@ static void buildAviHeader(uint8_t* h, uint16_t w, uint16_t ht,
   w32(h + 148, 0xFFFFFFFF);       // dwQuality = default
   w16(h + 156, 0); w16(h + 158, 0); w16(h + 160, w); w16(h + 162, ht);
 
-  tag(h + 164, "strf"); w32(h + 168, 48);   // BITMAPINFOHEADER + palette
+  tag(h + 164, "strf"); w32(h + 168, 40);   // BITMAPINFOHEADER
   w32(h + 172, 40);                         // biSize
   w32(h + 176, w);
-  w32(h + 180, ht);                         // positive: rows stored bottom-up
+  w32(h + 180, ht);
   w16(h + 184, 1);                          // biPlanes
-  w16(h + 186, 8);                          // biBitCount
-  w32(h + 188, 1);                          // biCompression = BI_RLE8
-  w32(h + 192, (uint32_t)w * ht);           // biSizeImage
-  w32(h + 204, 2);                          // biClrUsed
-  w32(h + 208, 2);                          // biClrImportant
-  h[212] = 0x00; h[213] = 0x00; h[214] = 0x00; h[215] = 0x00;   // 0 = black
-  h[216] = 0xFF; h[217] = 0xFF; h[218] = 0xFF; h[219] = 0x00;   // 1 = white
+  w16(h + 186, 24);                         // biBitCount
+  tag(h + 188, "MJPG");                     // biCompression
+  w32(h + 192, (uint32_t)w * ht * 3);       // biSizeImage
 
-  tag(h + 220, "LIST"); w32(h + 224, 4 + movi); tag(h + 228, "movi");
+  tag(h + 212, "LIST"); w32(h + 216, 4 + movi); tag(h + 220, "movi");
 }
 
 /* --------------------------- camera ---------------------------------- */
@@ -277,9 +292,9 @@ static void lockExposure(bool on) {
 static bool ensureBuffers(camera_fb_t* fb) {
   if (grayLen == fb->len && refBuf) return true;
 
-  free(refBuf); free(maskBuf); free(workBuf); free(rleBuf); free(burstBuf);
-  refBuf = maskBuf = workBuf = rleBuf = burstBuf = nullptr;
-  haveRef = false;
+  free(refBuf); free(maskBuf); free(workBuf); free(prevBuf); free(rleBuf); free(burstBuf);
+  refBuf = maskBuf = workBuf = prevBuf = rleBuf = burstBuf = nullptr;
+  haveRef = havePrev = false;
 
   grayLen = fb->len; grayW = fb->width; grayH = fb->height;
   rleCap  = grayLen * 2 + 16;              // worst case: alternating pixels
@@ -287,10 +302,11 @@ static bool ensureBuffers(camera_fb_t* fb) {
   refBuf   = (uint8_t*)ps_malloc(grayLen);
   maskBuf  = (uint8_t*)ps_malloc(grayLen);
   workBuf  = (uint8_t*)ps_malloc(grayLen);
+  prevBuf  = (uint8_t*)ps_malloc(grayLen);
   rleBuf   = (uint8_t*)ps_malloc(rleCap);
   burstBuf = (uint8_t*)ps_malloc((size_t)BURST_FRAMES * BURST_FRAME_MAX);
 
-  if (!refBuf || !maskBuf || !workBuf || !rleBuf || !burstBuf) {
+  if (!refBuf || !maskBuf || !workBuf || !prevBuf || !rleBuf || !burstBuf) {
     lastError = "Out of PSRAM";
     Serial.println("[MEM] allocation failed");
     grayLen = 0;
@@ -344,8 +360,33 @@ static bool captureReference() {
   return true;
 }
 
+/* Percentage of pixels that differ from the PREVIOUS frame.
+ *
+ * This is what drives the event logic, and it has to be inter-frame
+ * rather than against the reference: a hand left in the picture keeps a
+ * reference comparison permanently high, so the event would never close
+ * and the burst would fire again and again. Compared frame to frame, the
+ * same motionless hand reads 0% - movement is movement, presence is not. */
+static float interFrameMotion(camera_fb_t* fb) {
+  if (fb->len != grayLen) return 0.0f;
+  if (!havePrev) {
+    memcpy(prevBuf, fb->buf, grayLen);
+    havePrev = true;
+    return 0.0f;
+  }
+  const uint8_t thr = threshold;
+  uint32_t moved = 0;
+  for (size_t i = 0; i < grayLen; i++) {
+    const int d = (int)fb->buf[i] - (int)prevBuf[i];
+    if ((d < 0 ? -d : d) > thr) moved++;
+  }
+  memcpy(prevBuf, fb->buf, grayLen);
+  return 100.0f * (float)moved / (float)grayLen;
+}
+
 /* Compare to the reference. Fills maskBuf with 0x00 (changed) / 0xFF
- * (unchanged) and returns the percentage of changed pixels. */
+ * (unchanged) and returns the percentage of changed pixels. This is the
+ * picture the burst carries: it shows the SHAPE of whatever is there. */
 static float buildMask(camera_fb_t* fb) {
   if (!haveRef || fb->len != grayLen) return 0.0f;
 
@@ -398,27 +439,6 @@ static size_t encodeRuns(const uint8_t* img) {
   return o;
 }
 
-/* For the .avi: Microsoft RLE. [count][index], [0][0] ends a line,
- * [0][1] ends the bitmap, rows bottom-up to match a positive biHeight. */
-static size_t encodeRle8(const uint8_t* img, uint8_t* out) {
-  size_t o = 0;
-  for (int16_t y = (int16_t)grayH - 1; y >= 0; y--) {
-    const uint8_t* row = img + (size_t)y * grayW;
-    uint16_t x = 0;
-    while (x < grayW) {
-      const uint8_t v = row[x] ? 1 : 0;
-      uint16_t run = 1;
-      while (x + run < grayW && (row[x + run] ? 1 : 0) == v && run < 255) run++;
-      out[o++] = (uint8_t)run;
-      out[o++] = v;
-      x += run;
-    }
-    out[o++] = 0; out[o++] = 0;          // end of line
-  }
-  out[o++] = 0; out[o++] = 1;            // end of bitmap
-  return o;
-}
-
 /* ----------------------------- SD ------------------------------------ */
 static bool initSD() {
   if (!SD_MMC.begin(SD_MOUNT_POINT, SD_ONE_BIT_MODE)) {
@@ -455,27 +475,20 @@ static void writeBurstAvi() {
   buildAviHeader(hdr, grayW, grayH, BURST_FPS, 0, 0, 0);
   f.write(hdr, AVI_HEADER_BYTES);
 
-  uint8_t* enc = (uint8_t*)ps_malloc(rleCap);
   uint8_t* idx = (uint8_t*)ps_malloc(16UL * BURST_FRAMES);
-  if (!enc || !idx) { free(enc); free(idx); f.close(); lastError = "Out of PSRAM"; return; }
+  if (!idx) { f.close(); lastError = "Out of PSRAM"; return; }
 
   uint32_t movi = 0, maxFrame = 0;
   for (uint8_t k = 0; k < burstCount; k++) {
-    // runs -> mask
-    const uint8_t slot = burstOrder[k];
-    const uint8_t* src = burstBuf + (size_t)slot * BURST_FRAME_MAX;
-    size_t j = 0;
-    for (size_t o = 0; o + 1 < burstLen[slot] && j < grayLen; o += 2) {
-      const uint8_t run = src[o], v = src[o + 1] ? 0x00 : 0xFF;
-      for (uint8_t t = 0; t < run && j < grayLen; t++) maskBuf[j++] = v;
-    }
-    const size_t len = encodeRle8(maskBuf, enc);
-    const uint8_t pad = (len & 1) ? 1 : 0;
+    const uint8_t  slot = burstOrder[k];
+    const uint8_t* src  = burstBuf + (size_t)slot * BURST_FRAME_MAX;
+    const uint32_t len  = burstLen[slot];
+    const uint8_t  pad  = (len & 1) ? 1 : 0;      // RIFF chunks are word-aligned
 
     uint8_t ch[8];
     tag(ch, "00dc"); w32(ch + 4, len);
     f.write(ch, 8);
-    f.write(enc, len);
+    f.write(src, len);
     if (pad) { uint8_t z = 0; f.write(&z, 1); }
 
     uint8_t* e = idx + 16UL * k;
@@ -490,7 +503,7 @@ static void writeBurstAvi() {
   f.write(ih, 8);
   f.write(idx, 16UL * burstCount);
   f.close();
-  free(enc); free(idx);
+  free(idx);
 
   File patch = SD_MMC.open(path, "r+");
   if (patch) {
@@ -504,15 +517,105 @@ static void writeBurstAvi() {
   Serial.printf("[EVT] %s written, %u frames\n", path, burstCount);
 }
 
+/* ------------------------ raw recording ------------------------------ *
+ * File layout, little-endian, 16-byte header then frame after frame:
+ *   0  "ESPG"   4 bytes
+ *   4  width    uint16
+ *   6  height   uint16
+ *   8  fps      uint16
+ *  10  (unused) uint16
+ *  12  frames   uint32   - written as 0, patched when recording stops
+ *  16  frame 0, frame 1, ... each width*height bytes of 8-bit grayscale
+ * tools/replay.py reads exactly this.                                    */
+static bool startRawRecording() {
+  if (recOn) return true;
+  if (!sdReady) { lastError = "SD card not ready"; return false; }
+  if (!grayW)   { lastError = "camera not ready yet"; return false; }
+
+  for (uint16_t i = 1; i < 10000; i++) {
+    snprintf(recPath, sizeof(recPath), "/raw_%04u.gray", i);
+    if (!SD_MMC.exists(recPath)) break;
+  }
+  recFile = SD_MMC.open(recPath, FILE_WRITE);
+  if (!recFile) { lastError = String("Cannot create ") + recPath; return false; }
+
+  uint8_t h[16] = {0};
+  memcpy(h, REC_MAGIC, 4);
+  w16(h + 4, grayW);
+  w16(h + 6, grayH);
+  w16(h + 8, REC_FPS);
+  w32(h + 12, 0);                      // patched on stop
+  if (recFile.write(h, 16) != 16) {
+    recFile.close();
+    lastError = "SD write failed on the header";
+    return false;
+  }
+
+  recFrames = 0;
+  recNextMs = millis();
+  recOn = true;
+  lastError = "";
+  Serial.printf("[RAW] recording -> %s (%ux%u, %d fps)\n", recPath, grayW, grayH, REC_FPS);
+  return true;
+}
+
+static void stopRawRecording() {
+  if (!recOn) return;
+  recOn = false;
+  recFile.close();
+
+  File patch = SD_MMC.open(recPath, "r+");
+  if (patch) {
+    uint8_t n[4];
+    w32(n, recFrames);
+    patch.seek(12);
+    patch.write(n, 4);
+    patch.close();
+  }
+  Serial.printf("[RAW] stopped: %s, %u frames, %.1f MB\n", recPath, (unsigned)recFrames,
+                (16.0 + (double)recFrames * grayLen) / 1048576.0);
+}
+
+/* Writes the frame the detection has just looked at: one grab serves
+ * both, so recording costs no extra capture. */
+static void recordRaw(camera_fb_t* fb) {
+  if (!recOn) return;
+  const uint32_t now = millis();
+  if ((int32_t)(now - recNextMs) < 0) return;
+  recNextMs = now + 1000UL / REC_FPS;
+
+  if (recFile.write(fb->buf, fb->len) != fb->len) {
+    Serial.println("[RAW] SD write failed - card full?");
+    lastError = "SD write failed (card full?)";
+    stopRawRecording();
+    return;
+  }
+  recFrames++;
+  if ((recFrames & 0x1F) == 0) recFile.flush();
+}
+
 /* ------------------------ detection loop ----------------------------- */
-/* Keeps the most recent mask in the ring, overwriting the oldest. */
-static void ringPush() {
-  const size_t len = encodeRuns(maskBuf);
-  if (len > BURST_FRAME_MAX) return;              // absurdly noisy frame
-  memcpy(burstBuf + (size_t)ringPos * BURST_FRAME_MAX, rleBuf, len);
-  burstLen[ringPos] = len;
-  ringPos = (ringPos + 1) % BURST_FRAMES;
-  if (ringCount < BURST_FRAMES) ringCount++;
+/* Keeps the most recent PICTURE in the ring, overwriting the oldest.
+ *
+ * The mask is what decides when something happened; the burst is what you
+ * actually look at afterwards, so it holds real camera frames. They are
+ * JPEG encoded here and never touched again: the .avi stores these exact
+ * bytes, and the page decodes them as ordinary images.
+ *
+ * Encoding only runs while an event is under way, not while waiting. */
+static void ringPush(camera_fb_t* fb) {
+  uint8_t* jpg = nullptr;
+  size_t   len = 0;
+  if (!fmt2jpg(fb->buf, fb->len, fb->width, fb->height,
+               PIXFORMAT_GRAYSCALE, BURST_QUALITY, &jpg, &len)) return;
+
+  if (len <= BURST_FRAME_MAX) {
+    memcpy(burstBuf + (size_t)ringPos * BURST_FRAME_MAX, jpg, len);
+    burstLen[ringPos] = len;
+    ringPos = (ringPos + 1) % BURST_FRAMES;
+    if (ringCount < BURST_FRAMES) ringCount++;
+  }
+  free(jpg);
 }
 
 /* Freezes the ring into a burst, oldest frame first. */
@@ -540,13 +643,14 @@ static void motionTick() {
   if (!ensureBuffers(fb)) { esp_camera_fb_return(fb); return; }
   if (!haveRef) { esp_camera_fb_return(fb); return; }
 
-  lastPct = buildMask(fb);
-  esp_camera_fb_return(fb);
+  recordRaw(fb);                      // same grab feeds the recording
+  lastPct = interFrameMotion(fb);     // drives the state machine
+  refPct  = buildMask(fb);            // the mask, for the on-demand view
 
   switch (evtState) {
 
     case EVT_ACTIVE:
-      ringPush();                                  // keep the movement itself
+      ringPush(fb);                                // keep the movement itself
       if (lastPct < calmPct) {
         calmRun++;
         if (calmRun >= CALM_CYCLES) {
@@ -590,10 +694,12 @@ static void motionTick() {
         ringCount   = ringPos = 0;
         burstFile[0] = 0;
         Serial.printf("[EVT] movement started at %.1f%%\n", lastPct);
-        ringPush();
+        ringPush(fb);
       }
       break;
   }
+
+  esp_camera_fb_return(fb);
 }
 
 /* ----------------------------- web ----------------------------------- */
@@ -605,16 +711,17 @@ static void handleRoot() { server.send_P(200, "text/html", APP_PAGE); }
 static void handleMotion() {
   char j[256];
   snprintf(j, sizeof(j),
-           "{\"pct\":%.2f,\"move\":%.2f,\"calm\":%.2f,\"minms\":%u,\"thr\":%u,"
+           "{\"pct\":%.2f,\"refpct\":%.2f,\"move\":%.2f,\"calm\":%.2f,\"minms\":%u,\"thr\":%u,"
            "\"ref\":%s,\"lock\":%s,\"state\":%u,\"active\":%u,\"n\":%u,"
-           "\"events\":%u,\"sd\":%s,\"w\":%u,\"h\":%u,\"file\":\"%s\"}",
-           lastPct, movePct, calmPct, (unsigned)minActiveMs, (unsigned)threshold,
+           "\"events\":%u,\"sd\":%s,\"rec\":%s,\"recn\":%u,\"recfile\":\"%s\",\"w\":%u,\"h\":%u,\"file\":\"%s\"}",
+           lastPct, refPct, movePct, calmPct, (unsigned)minActiveMs, (unsigned)threshold,
            haveRef ? "true" : "false",
            exposureLocked ? "true" : "false",
            (unsigned)evtState,
            (unsigned)(evtState == EVT_ACTIVE ? (millis() - activeStart) : activeMs),
            (unsigned)burstCount, (unsigned)eventCount,
            sdReady ? "true" : "false",
+           recOn ? "true" : "false", (unsigned)recFrames, recPath,
            (unsigned)grayW, (unsigned)grayH, burstFile);
   cors();
   server.send(200, "application/json", j);
@@ -644,6 +751,17 @@ static void handleBurst() {
     server.sendContent((const char*)len, 4);
     server.sendContent((const char*)(burstBuf + (size_t)slot * BURST_FRAME_MAX), burstLen[slot]);
   }
+}
+
+static void handleRecord() {
+  const bool on = (server.arg("on") == "1");
+  if (on) {
+    if (!startRawRecording()) { cors(); server.send(500, "text/plain", lastError); return; }
+  } else {
+    stopRawRecording();
+  }
+  cors();
+  server.send(200, "text/plain", recOn ? "recording" : "stopped");
 }
 
 static void handleClear() {
@@ -716,7 +834,7 @@ static void handleMask() {
   camera_fb_t* fb = esp_camera_fb_get();
   if (!fb) { server.send(503, "text/plain", "capture failed"); return; }
   if (!ensureBuffers(fb)) { esp_camera_fb_return(fb); server.send(500, "text/plain", "no memory"); return; }
-  lastPct = buildMask(fb);
+  refPct = buildMask(fb);   // on-demand view: does not touch the motion figure
   esp_camera_fb_return(fb);
 
   const size_t len = encodeRuns(maskBuf);
@@ -741,7 +859,7 @@ static void handleFiles() {
     while (f) {
       String n = f.name();
       if (n.startsWith("/")) n = n.substring(1);
-      if (n.endsWith(".avi")) {
+      if (n.endsWith(".avi") || n.endsWith(".gray")) {
         char row[96];
         snprintf(row, sizeof(row), "%s{\"n\":\"%s\",\"s\":%u}",
                  first ? "" : ",", n.c_str(), (unsigned)f.size());
@@ -852,6 +970,7 @@ void setup() {
   server.on("/",          handleRoot);
   server.on("/motion",    handleMotion);
   server.on("/burst",     handleBurst);
+  server.on("/record",    handleRecord);
   server.on("/clear",     handleClear);
   server.on("/mask",      handleMask);
   server.on("/snapshot",  handleSnapshot);

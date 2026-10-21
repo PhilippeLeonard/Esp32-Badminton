@@ -59,8 +59,9 @@
 <canvas id="cv" width="320" height="240"></canvas>
 <div class="st" id="info">non connecte</div>
 
-<h1>Mouvement</h1>
+<h1>Mouvement (entre images)</h1>
 <div class="big" id="pct">--</div>
+<div class="st" id="refpct">&nbsp;</div>
 <div class="bar">
   <div class="fill" id="fill"></div>
   <div class="mark" id="mark"></div>
@@ -83,6 +84,10 @@
   <button id="ref" class="sec">Prendre la reference</button>
   <button id="look" class="sec">Voir le masque</button>
 </div>
+
+<h1>Enregistrement brut</h1>
+<div class="st" id="rstat">arrete</div>
+<button id="rec" class="idle">Enregistrer la video brute</button>
 
 <h1>Derniere rafale</h1>
 <div class="st" id="bstat">aucune</div>
@@ -131,15 +136,17 @@ const url  = p => "http://" + host() + p;
 const human = b => b > 1048576 ? (b/1048576).toFixed(1) + " Mo" : (b/1024).toFixed(1) + " ko";
 
 /* ---------------- dessin d'un masque run-length ----------------
- * Format : [count][0 = inchange, 1 = change], lu d'affilee, de haut en
- * bas. Pas de JPEG, pas de decodage d'image : quelques centaines
- * d'octets pour une scene immobile. */
+ * Format : [count][valeur], lu d'affilee, de haut en bas.
+ *
+ * La valeur suit encodeRuns() cote carte : 1 = pixel INCHANGE (blanc),
+ * 0 = pixel CHANGE (noir). L'inverser retourne tout le masque - le fond
+ * devient noir et l'objet blanc, ce qui ne ressemble plus a rien. */
 function drawRuns(bytes, w, h) {
   if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }
   const img = ctx.createImageData(w, h), p = img.data;
   let j = 0;
   for (let o = 0; o + 1 < bytes.length; o += 2) {
-    const run = bytes[o], v = bytes[o+1] ? 0 : 255;     // change = noir
+    const run = bytes[o], v = bytes[o+1] ? 255 : 0;     // 1 = inchange = blanc
     for (let k = 0; k < run && j < w*h; k++, j++) {
       const i = j*4;
       p[i] = p[i+1] = p[i+2] = v; p[i+3] = 255;
@@ -158,7 +165,10 @@ async function poll() {
     return;
   }
 
+  /* pct = difference avec l'image precedente, c'est elle qui declenche.
+     refpct = difference avec la reference, c'est ce que montre le masque. */
   $("pct").textContent = S.pct.toFixed(2) + " %";
+  $("refpct").textContent = "vs reference : " + (S.refpct ?? 0).toFixed(2) + " %";
   $("fill").style.width = Math.min(100, S.pct * 3) + "%";
   $("mark").style.left  = Math.min(100, S.move * 3) + "%";
   $("fill").style.background = S.pct >= S.move ? "var(--stop)" : "var(--accent)";
@@ -178,6 +188,14 @@ async function poll() {
     + (S.lock ? " · expo verrouillee" : "")
     + " · " + S.events + " evenement(s)";
   $("err").textContent = S.ref ? "" : "Prends une reference, scene au repos.";
+
+  /* Enregistrement brut : tourne en parallele de la detection, sur la
+     meme capture. Sert a rejouer l'algorithme hors ligne. */
+  $("rec").textContent = S.rec ? "Arreter l'enregistrement" : "Enregistrer la video brute";
+  $("rec").className   = S.rec ? "rec" : "idle";
+  $("rstat").textContent = S.rec
+    ? S.recn + " images · " + (S.recn * S.w * S.h / 1048576).toFixed(1) + " Mo · " + S.recfile
+    : "arrete";
 
   if (!document.activeElement || document.activeElement.type !== "range") {
     $("trig").value  = S.move;  $("tv").textContent  = (+S.move).toFixed(1);
@@ -210,6 +228,7 @@ async function fetchBurst() {
       frames.push(b.subarray(o, o + len)); o += len;
     }
     burst = { w, h, frames };
+    await decodeBurst();
     $("bstat").textContent = n + " images · " + human(b.length)
       + (S.file ? " · " + S.file : "");
     $("play").disabled = false;
@@ -221,16 +240,28 @@ async function fetchBurst() {
   }
 }
 
+/* Les images de la rafale sont de vraies photos JPEG, pas des masques :
+   on les decode une fois pour toutes, puis on les joue en boucle. */
+async function decodeBurst() {
+  burst.bitmaps = [];
+  for (const f of burst.frames) {
+    try {
+      burst.bitmaps.push(await createImageBitmap(new Blob([f], { type: "image/jpeg" })));
+    } catch (e) { /* image illisible : on la saute */ }
+  }
+}
+
 function play() {
-  if (!burst) return;
+  if (!burst || !burst.bitmaps || !burst.bitmaps.length) return;
   clearInterval(playTimer);
+  if (cv.width !== burst.w || cv.height !== burst.h) { cv.width = burst.w; cv.height = burst.h; }
   let k = 0;
   playTimer = setInterval(() => {
-    drawRuns(burst.frames[k], burst.w, burst.h);
-    $("bstat").textContent = "image " + (k+1) + "/" + burst.frames.length;
-    if (++k >= burst.frames.length) {
+    ctx.drawImage(burst.bitmaps[k], 0, 0, cv.width, cv.height);
+    $("bstat").textContent = "image " + (k+1) + "/" + burst.bitmaps.length;
+    if (++k >= burst.bitmaps.length) {
       clearInterval(playTimer);
-      $("bstat").textContent = burst.frames.length + " images"
+      $("bstat").textContent = burst.bitmaps.length + " images"
         + (S.file ? " · " + S.file : "");
     }
   }, 100);
@@ -275,6 +306,11 @@ $("minms").oninput  = () => { $("mv").textContent = (+$("minms").value).toFixed(
 $("minms").onchange = () => fetch(url("/minactive?v=" + Math.round($("minms").value*1000))).catch(()=>{});
 $("thr").oninput    = () => { $("sv").textContent = $("thr").value; };
 $("thr").onchange   = () => fetch(url("/threshold?v=" + $("thr").value)).catch(()=>{});
+
+$("rec").onclick = async () => {
+  try { await fetch(url("/record?on=" + (S.rec ? 0 : 1))); } catch (e) {}
+  poll(); files();
+};
 
 $("play").onclick  = play;
 $("clear").onclick = async () => {
