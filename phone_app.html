@@ -1,0 +1,307 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="mobile-web-app-capable" content="yes">
+<title>Detecteur de mouvement</title>
+<style>
+  :root{
+    --bg:#101214; --panel:#191d21; --line:#2a3036; --text:#e8eaed; --muted:#9aa4ad;
+    --accent:#2980b9; --go:#27ae60; --stop:#c0392b; --flat:#333b42; --warn:#e67e22;
+  }
+  *{box-sizing:border-box}
+  body{font-family:system-ui,-apple-system,sans-serif;margin:0;padding:12px;
+       background:var(--bg);color:var(--text);max-width:720px;margin-inline:auto}
+  h1{font-size:15px;margin:16px 0 6px;color:var(--muted);font-weight:600;
+     text-transform:uppercase;letter-spacing:.05em}
+  canvas{width:100%;border-radius:10px;background:#000;display:block;aspect-ratio:4/3}
+  button{font-size:16px;padding:13px 14px;border:0;border-radius:9px;color:#fff;
+         margin:5px 0;width:100%;font-weight:600}
+  button:disabled{opacity:.35}
+  .row{display:flex;gap:8px}
+  .sec{background:var(--flat)}.on{background:var(--accent)}
+  .idle{background:var(--go)}.rec{background:var(--stop)}
+  .st{font-size:13px;color:var(--muted);margin:5px 0}
+  .err{color:#e74c3c;font-size:13px;min-height:16px}
+  .bar{position:relative;height:30px;background:#0b0d0f;border:1px solid var(--line);
+       border-radius:7px;overflow:hidden;margin:6px 0}
+  .fill{position:absolute;inset:0 auto 0 0;width:0;background:var(--accent);
+        transition:width .12s linear}
+  .mark{position:absolute;top:0;bottom:0;width:2px;background:var(--warn)}
+  .barTxt{position:relative;line-height:30px;text-align:center;font-variant-numeric:tabular-nums;
+          font-weight:700;font-size:15px;text-shadow:0 0 4px #000}
+  .big{font-size:34px;font-weight:700;font-variant-numeric:tabular-nums;text-align:center;
+       margin:4px 0}
+  .tag{display:inline-block;padding:3px 9px;border-radius:20px;font-size:12px;font-weight:600}
+  .t-idle{background:#2a3036;color:var(--muted)}
+  .t-cap{background:var(--stop)}
+  .t-ready{background:var(--go)}
+  .t-dis{background:#4a3a1a;color:#e0b060}
+  input[type=text]{flex:1;min-width:0;background:#0b0d0f;border:1px solid var(--line);
+       color:var(--text);padding:11px;border-radius:7px;font-size:16px}
+  input[type=range]{width:100%}
+  table{width:100%;border-collapse:collapse;font-size:14px}
+  td,th{padding:7px 5px;border-bottom:1px solid var(--line);text-align:left}
+  th{color:var(--muted);font-weight:600}
+  a{color:#5dade2;margin-right:12px}
+  .conn{display:flex;gap:8px;align-items:center;background:var(--panel);
+        padding:8px;border-radius:9px;margin-bottom:10px}
+</style>
+</head>
+<body>
+
+<div class="conn" id="connBar">
+  <input id="ip" type="text" inputmode="url" placeholder="192.168.4.1" autocomplete="off">
+  <button id="conn" class="on" style="width:auto;padding:11px 18px;margin:0">Connecter</button>
+</div>
+
+<canvas id="cv" width="320" height="240"></canvas>
+<div class="st" id="info">non connecte</div>
+
+<h1>Mouvement</h1>
+<div class="big" id="pct">--</div>
+<div class="bar">
+  <div class="fill" id="fill"></div>
+  <div class="mark" id="mark"></div>
+  <div class="barTxt" id="state">&nbsp;</div>
+</div>
+
+<div class="st">Mouvement a partir de : <span id="tv">3.0</span> % de l'image</div>
+<input id="trig" type="range" min="0.2" max="30" step="0.2" value="3">
+
+<div class="st">Scene calme en dessous de : <span id="cv2">0.8</span> %</div>
+<input id="calm" type="range" min="0.1" max="10" step="0.1" value="0.8">
+
+<div class="st">Duree minimale du mouvement : <span id="mv">5.0</span> s</div>
+<input id="minms" type="range" min="0" max="20" step="0.5" value="5">
+
+<div class="st">Sensibilite par pixel : <span id="sv">30</span></div>
+<input id="thr" type="range" min="5" max="120" value="30">
+
+<div class="row">
+  <button id="ref" class="sec">Prendre la reference</button>
+  <button id="look" class="sec">Voir le masque</button>
+</div>
+
+<h1>Derniere rafale</h1>
+<div class="st" id="bstat">aucune</div>
+<div class="row">
+  <button id="play" class="idle" disabled>Rejouer les 20 images</button>
+  <button id="clear" class="sec" disabled>Effacer</button>
+</div>
+<div class="err" id="err"></div>
+
+<h1>Fichiers sur la carte SD</h1>
+<table id="ft"></table>
+
+<script>
+/* ===================================================================
+ *  La carte n'envoie pas de video. Elle compare chaque image a une
+ *  reference et renvoie UN nombre : le pourcentage de pixels changes.
+ *  Quand ce nombre depasse le seuil, elle capture 20 images de masque
+ *  et les tient pretes ; cette page va alors les chercher d'un coup.
+ * =================================================================== */
+
+const $ = i => document.getElementById(i);
+const cv = $("cv"), ctx = cv.getContext("2d");
+
+const store = {
+  get(k)   { try { return localStorage.getItem(k) || ""; } catch (e) { return ""; } },
+  set(k,v) { try { localStorage.setItem(k, v); } catch (e) {} }
+};
+
+let base = store.get("esp32ip") || location.host || "";
+let running = false;
+let S = {};
+let burst = null;          // { w, h, frames: [Uint8Array] }
+let playTimer = null;
+let lastEvents = -1;
+
+$("ip").value = base;
+/* Servie depuis la carte, la page se parle a elle-meme : pas d'adresse
+   a taper, pas de CORS. Ouverte depuis un fichier, le champ sert. */
+if (location.protocol.startsWith("http") && location.host) {
+  base = location.host;
+  $("connBar").style.display = "none";
+}
+
+const host = () => base.replace(/^https?:\/\//, "").replace(/\/.*$/, "");
+const url  = p => "http://" + host() + p;
+const human = b => b > 1048576 ? (b/1048576).toFixed(1) + " Mo" : (b/1024).toFixed(1) + " ko";
+
+/* ---------------- dessin d'un masque run-length ----------------
+ * Format : [count][0 = inchange, 1 = change], lu d'affilee, de haut en
+ * bas. Pas de JPEG, pas de decodage d'image : quelques centaines
+ * d'octets pour une scene immobile. */
+function drawRuns(bytes, w, h) {
+  if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }
+  const img = ctx.createImageData(w, h), p = img.data;
+  let j = 0;
+  for (let o = 0; o + 1 < bytes.length; o += 2) {
+    const run = bytes[o], v = bytes[o+1] ? 0 : 255;     // change = noir
+    for (let k = 0; k < run && j < w*h; k++, j++) {
+      const i = j*4;
+      p[i] = p[i+1] = p[i+2] = v; p[i+3] = 255;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+}
+
+/* ---------------- etat, interroge plusieurs fois par seconde ---------------- */
+async function poll() {
+  if (!running) return;
+  try {
+    S = await (await fetch(url("/motion"), { cache: "no-store" })).json();
+  } catch (e) {
+    $("info").textContent = "pas de reponse de " + host();
+    return;
+  }
+
+  $("pct").textContent = S.pct.toFixed(2) + " %";
+  $("fill").style.width = Math.min(100, S.pct * 3) + "%";
+  $("mark").style.left  = Math.min(100, S.move * 3) + "%";
+  $("fill").style.background = S.pct >= S.move ? "var(--stop)" : "var(--accent)";
+
+  /* Un evenement = du mouvement qui dure, PUIS un retour au calme. Une
+     main immobile ne declenche donc jamais : rien ne retombe. */
+  const st = $("state");
+  if (S.state === 1)
+    st.innerHTML = '<span class="tag t-cap">mouvement ' + (S.active/1000).toFixed(1) + ' s</span>';
+  else if (S.state === 2)
+    st.innerHTML = '<span class="tag t-ready">rafale prete</span>';
+  else
+    st.innerHTML = '<span class="tag t-idle">en veille</span>';
+
+  $("info").textContent = S.w + "x" + S.h
+    + (S.ref ? " · reference ok" : " · PAS DE REFERENCE")
+    + (S.lock ? " · expo verrouillee" : "")
+    + " · " + S.events + " evenement(s)";
+  $("err").textContent = S.ref ? "" : "Prends une reference, scene au repos.";
+
+  if (!document.activeElement || document.activeElement.type !== "range") {
+    $("trig").value  = S.move;  $("tv").textContent  = (+S.move).toFixed(1);
+    $("calm").value  = S.calm;  $("cv2").textContent = (+S.calm).toFixed(1);
+    $("minms").value = S.minms / 1000; $("mv").textContent = (S.minms/1000).toFixed(1);
+    $("thr").value   = S.thr;   $("sv").textContent  = S.thr;
+  }
+
+  /* Une rafale prete est recuperee une seule fois, automatiquement. */
+  if (S.state === 2 && S.events !== lastEvents) {
+    lastEvents = S.events;
+    await fetchBurst();
+  }
+}
+
+/* ---------------- recuperation de la rafale ----------------
+ * [u16 largeur][u16 hauteur][u8 nombre], puis par image
+ * [u32 longueur][octets run-length]. Un seul transfert par evenement. */
+async function fetchBurst() {
+  try {
+    const r = await fetch(url("/burst"), { cache: "no-store" });
+    if (!r.ok) return;
+    const b = new Uint8Array(await r.arrayBuffer());
+    const dv = new DataView(b.buffer);
+    const w = dv.getUint16(0, true), h = dv.getUint16(2, true), n = b[4];
+    const frames = [];
+    let o = 5;
+    for (let k = 0; k < n; k++) {
+      const len = dv.getUint32(o, true); o += 4;
+      frames.push(b.subarray(o, o + len)); o += len;
+    }
+    burst = { w, h, frames };
+    $("bstat").textContent = n + " images · " + human(b.length)
+      + (S.file ? " · " + S.file : "");
+    $("play").disabled = false;
+    $("clear").disabled = false;
+    play();
+    files();
+  } catch (e) {
+    $("err").textContent = "rafale illisible : " + e.message;
+  }
+}
+
+function play() {
+  if (!burst) return;
+  clearInterval(playTimer);
+  let k = 0;
+  playTimer = setInterval(() => {
+    drawRuns(burst.frames[k], burst.w, burst.h);
+    $("bstat").textContent = "image " + (k+1) + "/" + burst.frames.length;
+    if (++k >= burst.frames.length) {
+      clearInterval(playTimer);
+      $("bstat").textContent = burst.frames.length + " images"
+        + (S.file ? " · " + S.file : "");
+    }
+  }, 100);
+}
+
+/* ---------------- commandes ---------------- */
+$("conn").onclick = () => {
+  base = $("ip").value.trim();
+  store.set("esp32ip", base);
+  start();
+};
+
+function start() {
+  if (!base) return;
+  running = true;
+  poll(); files();
+}
+
+$("ref").onclick = async () => {
+  $("ref").textContent = "mesure de l'exposition...";
+  try { await fetch(url("/reference")); } catch (e) {}
+  $("ref").textContent = "Prendre la reference";
+  poll();
+};
+
+/* Le masque se regarde a la demande, il n'est jamais pousse en continu. */
+$("look").onclick = async () => {
+  try {
+    const r = await fetch(url("/mask"), { cache: "no-store" });
+    if (!r.ok) { $("err").textContent = "prends d'abord une reference"; return; }
+    const b = new Uint8Array(await r.arrayBuffer());
+    const dv = new DataView(b.buffer);
+    drawRuns(b.subarray(5), dv.getUint16(0, true), dv.getUint16(2, true));
+  } catch (e) { $("err").textContent = e.message; }
+};
+
+$("trig").oninput   = () => { $("tv").textContent = (+$("trig").value).toFixed(1); };
+$("trig").onchange  = () => fetch(url("/trigger?v=" + $("trig").value)).catch(()=>{});
+$("calm").oninput   = () => { $("cv2").textContent = (+$("calm").value).toFixed(1); };
+$("calm").onchange  = () => fetch(url("/calm?v=" + $("calm").value)).catch(()=>{});
+$("minms").oninput  = () => { $("mv").textContent = (+$("minms").value).toFixed(1); };
+$("minms").onchange = () => fetch(url("/minactive?v=" + Math.round($("minms").value*1000))).catch(()=>{});
+$("thr").oninput    = () => { $("sv").textContent = $("thr").value; };
+$("thr").onchange   = () => fetch(url("/threshold?v=" + $("thr").value)).catch(()=>{});
+
+$("play").onclick  = play;
+$("clear").onclick = async () => {
+  clearInterval(playTimer);
+  burst = null;
+  $("play").disabled = true; $("clear").disabled = true;
+  $("bstat").textContent = "aucune";
+  try { await fetch(url("/clear")); } catch (e) {}
+};
+
+async function files() {
+  let f = [];
+  try { f = await (await fetch(url("/files"))).json(); } catch (e) { return; }
+  $("ft").innerHTML = "<tr><th>Nom</th><th>Taille</th><th></th></tr>" + f.map(x =>
+    "<tr><td>" + x.n + "</td><td>" + human(x.s) + "</td><td>"
+    + "<a href='" + url("/download?f=/" + x.n) + "'>telecharger</a>"
+    + "<a href='#' data-del='" + x.n + "'>supprimer</a></td></tr>").join("");
+  $("ft").querySelectorAll("[data-del]").forEach(a => a.onclick = async e => {
+    e.preventDefault();
+    if (confirm("Supprimer " + a.dataset.del + " ?")) {
+      await fetch(url("/delete?f=/" + a.dataset.del)); files();
+    }
+  });
+}
+
+setInterval(poll, 350);
+start();
+</script>
+</body>
+</html>
