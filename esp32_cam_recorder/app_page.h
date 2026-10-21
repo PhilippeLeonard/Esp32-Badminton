@@ -137,7 +137,11 @@ const store = {
   set(k,v) { try { localStorage.setItem(k, v); } catch (e) {} }
 };
 
-let base = store.get("esp32ip") || location.host || "";
+/* Servie par la carte, la page s'adresse a son propre hote et a rien
+   d'autre : l'adresse memorisee d'une session precedente ne doit jamais
+   reprendre la main. */
+const servedByBoard = location.protocol.startsWith("http") && !!location.host;
+let base = servedByBoard ? location.host : (store.get("esp32ip") || "");
 let running = false;
 let lastOkMs = 0;          // derniere reponse reellement recue
 let S = {};
@@ -151,8 +155,7 @@ $("ip").value = base;
    a taper, pas de CORS. Ouverte depuis un fichier, le champ sert. */
 /* Servie par la carte : l'adresse est connue, le champ ne sert a rien.
    Le bouton reste, lui : c'est devenu le temoin de connexion. */
-if (location.protocol.startsWith("http") && location.host) {
-  base = location.host;
+if (servedByBoard) {
   $("ip").style.display = "none";
   $("conn").style.flex = "1";
 }
@@ -330,13 +333,19 @@ function play() {
 
 /* ---------------- commandes ---------------- */
 $("conn").onclick = () => {
-  base = $("ip").value.trim();
-  store.set("esp32ip", base);
+  /* Servie par la carte, le bouton n'est qu'un temoin : il relance la
+     lecture sans toucher a l'adresse. Reaffecter base depuis le champ
+     masque le faisait basculer sur l'IP memorisee, et plus rien ne
+     repondait. */
+  if (!servedByBoard) {
+    base = $("ip").value.trim();
+    store.set("esp32ip", base);
+  }
   start();
 };
 
 function start() {
-  if (!base) return;
+  if (!base) { $("info").textContent = "aucune adresse : saisis l'IP de la carte"; return; }
   running = true;
   setConnected(false);
   poll(); files();
