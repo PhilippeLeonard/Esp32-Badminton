@@ -7,6 +7,8 @@ transmet des images que lorsqu'un événement se termine.
 ## Disposition du dépôt
 
 ```
+esp32_cam_simple/
+    esp32_cam_simple.ino     la version simple (photo + enregistrement)
 esp32_cam_recorder/
     esp32_cam_recorder.ino   le firmware  <-- ouvrir CE dossier dans l'IDE
     app_page.h               généré, ne pas éditer à la main
@@ -62,3 +64,32 @@ python tools/replay.py raw_0001.gray --sweep
 
 balaie une grille de réglages et compte les événements trouvés pour
 chacun, ce qui évite de reflasher à chaque essai.
+
+## Version simple : `esp32_cam_simple/`
+
+Un croquis a part, independant du detecteur. La carte rejoint le hotspot
+du telephone (`WIFI_SSID` / `WIFI_PASS` en haut du fichier) et sert une
+page a deux boutons sur `http://esp32cam.local` ou sur l'adresse affichee
+au port serie :
+
+- **Prendre une image** -> `GET /shot`, un seul JPEG pris au moment du
+  clic. Rien n'est diffuse en continu.
+- **Demarrer / arreter l'enregistrement** -> `GET /record?on=1|0`, ecrit
+  `/rec_NNNN.avi` sur la carte SD : du MJPEG, les images sortant deja
+  compressees du capteur. VGA, 10 images/s, lisible par VLC.
+
+L'enregistrement se coupe tout seul dans trois cas, et le fichier est
+referme proprement (index et entete corriges) a chaque fois :
+
+| cause | reglage |
+| --- | --- |
+| il reste moins de 20 Mo sur la carte | `SD_MIN_FREE_MB` |
+| 18 000 images, soit 30 min a 10 i/s | `REC_MAX_FRAMES` |
+| une ecriture SD echoue | - |
+
+La place restante est suivie par soustraction depuis le debut de
+l'enregistrement : interroger la FAT a chaque image ferait decrocher
+l'ecriture. La raison de l'arret s'affiche sous les boutons.
+
+Les fichiers de la carte sont listes en bas de la page, avec un lien de
+telechargement et un lien pour supprimer.
