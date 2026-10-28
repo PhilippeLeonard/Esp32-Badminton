@@ -78,24 +78,31 @@ au port serie :
   `/rec_NNNN.rgb` sur la carte SD : **couleur, aucune compression**, les
   octets RGB565 sortis du capteur tels quels.
 
-### Debit, et pourquoi 5 images/s
+### Debit : c'est la carte SD qui decide
 
 GPIO 4 porte Y2 de la camera et sert aussi de DATA1 au bus SD : le mode
-4 bits est donc impossible sur cette carte, la SD reste en 1 bit et
-plafonne vers 1 Mo/s en ecriture soutenue. Le debit exige vaut
-`largeur x hauteur x 2 x images/s` :
+4 bits est donc impossible sur cette carte, la SD reste en 1 bit. Le
+debit exige vaut `largeur x hauteur x 2 x images/s`, et il faut au moins
+30 % de marge - le reste du temps part dans le wifi et la camera.
 
-| reglage | debit | verdict |
-| --- | --- | --- |
-| QVGA 320x240 @ 5 i/s | 768 ko/s | defaut, deja tenu par l'ancienne version |
-| QVGA 320x240 @ 10 i/s | 1,5 Mo/s | decroche |
-| QQVGA 160x120 @ 20 i/s | 768 ko/s | plus fluide, moins defini |
+Au demarrage le croquis ecrit ~4 Mo **par blocs de la taille d'une
+image** (une carte SD est bien plus rapide par gros blocs : mesurer par
+petits paquets la sous-estime), puis annonce le debit mesure, celui
+qu'il faut, et combien d'images par seconde la carte tient reellement :
 
-Au demarrage le croquis ecrit 4 Mo sur la carte pour mesurer son debit
-reel et le compare a ce qu'il faut : une carte trop lente se voit au port
-serie avant le match, et la page l'affiche aussi. Si la carte prend du
-retard en cours de route, les images en retard sont **sautees** et
-comptees (`sautees` dans la page) au lieu de s'accumuler.
+```
+[SD] ecriture mesuree: 0.31 Mo/s par blocs de 37 ko
+[SD] l'enregistrement demande 0.18 Mo/s
+[SD] cette carte tient environ 6.4 images/s a 160x120
+```
+
+| carte | reglage tenable |
+| --- | --- |
+| 0,3 Mo/s | QQVGA 160x120 @ 5 i/s (defaut) ou QVGA 320x240 @ 2 i/s |
+| 1,0 Mo/s | QVGA 320x240 @ 5 i/s, ou QQVGA @ 20 i/s |
+
+Si la carte prend du retard en cours de route, les images en retard sont
+**sautees** et comptees (`sautees` dans la page) au lieu de s'accumuler.
 
 ### Arrets automatiques
 

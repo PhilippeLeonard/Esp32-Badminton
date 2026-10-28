@@ -35,15 +35,18 @@
 static const char* WIFI_SSID = "Philphone";   // hotspot 2.4 GHz du telephone
 static const char* WIFI_PASS = "12345678";
 static const char* HOSTNAME  = "esp32cam";    // http://esp32cam.local
+#define STA_RETRY_MS     60000           // intervalle entre deux tentatives
 
-/* Debit de l'enregistrement = largeur * hauteur * 2 * REC_FPS.
- * La carte SD ne tourne qu'en 1 bit (voir SD_ONE_BIT_MODE plus bas), ce
- * qui plafonne vers 1 Mo/s en ecriture soutenue. QVGA a 5 i/s fait
- * 768 ko/s : c'est exactement le debit que l'ancienne version tenait deja
- * en gris. Monter a 10 i/s demanderait 1,5 Mo/s et ferait decrocher.
- *   QVGA  320x240 @ 5  -> 768 ko/s   (defaut)
- *   QQVGA 160x120 @ 20 -> 768 ko/s   (plus fluide, moins defini)        */
-#define FRAME_SIZE       FRAMESIZE_QVGA  // 320x240
+/* Debit de l'enregistrement = largeur * hauteur * 2 * REC_FPS. La carte
+ * SD ne tourne qu'en 1 bit (voir SD_ONE_BIT_MODE plus bas) et le debit
+ * mesure au demarrage est ce qui decide des reglages tenables :
+ *   carte a 0,3 Mo/s : QQVGA 160x120 @ 5  -> 192 ko/s   (defaut prudent)
+ *                      QVGA  320x240 @ 2  -> 307 ko/s
+ *   carte a 1,0 Mo/s : QVGA  320x240 @ 5  -> 768 ko/s
+ *                      QQVGA 160x120 @ 20 -> 768 ko/s
+ * Laisser au moins 30 % de marge : le reste du temps processeur part
+ * dans le wifi et la camera.                                            */
+#define FRAME_SIZE       FRAMESIZE_QQVGA // 160x120
 #define REC_FPS          5
 #define PREVIEW_QUALITY  10              // qualite du JPEG de /shot seulement
 #define XCLK_FREQ_HZ     10000000
@@ -175,25 +178,35 @@ static uint64_t sdFreeBytes() {
   return (total > used) ? (total - used) : 0;
 }
 
-/* Quatre mega-octets ecrits puis effaces : une carte lente se voit tout
- * de suite au demarrage, au lieu de donner un enregistrement qui saute. */
-static void benchSD() {
-  if (!sdReady) return;
-  static uint8_t blk[8192];
-  memset(blk, 0xA5, sizeof(blk));
+/* Quelques mega-octets ecrits puis effaces : une carte lente se voit tout
+ * de suite au demarrage, au lieu de donner un enregistrement qui saute.
+ * Les blocs font exactement la taille d'une image, comme a l'usage : une
+ * carte SD est bien plus rapide par gros blocs, mesurer par petits
+ * paquets la sous-estime largement. */
+static void benchSD(uint32_t blockLen) {
+  if (!sdReady || !blockLen) return;
+  uint8_t* blk = (uint8_t*)ps_malloc(blockLen);
+  if (!blk) return;
+  memset(blk, 0xA5, blockLen);
+
   File f = SD_MMC.open("/bench.tmp", FILE_WRITE);
-  if (!f) return;
+  if (!f) { free(blk); return; }
+  const uint32_t blocks = 4194304UL / blockLen + 1;   // ~4 Mo
   const uint32_t t0 = millis();
-  const int blocks = 512;                       // 4 Mo
-  for (int i = 0; i < blocks; i++) {
-    if (f.write(blk, sizeof(blk)) != sizeof(blk)) break;
+  uint32_t written = 0;
+  for (uint32_t i = 0; i < blocks; i++) {
+    if (f.write(blk, blockLen) != blockLen) break;
+    written += blockLen;
   }
   f.flush();
   const uint32_t ms = millis() - t0;
   f.close();
   SD_MMC.remove("/bench.tmp");
-  if (ms) sdMbPerSec = (blocks * sizeof(blk) / 1048576.0f) * 1000.0f / ms;
-  Serial.printf("[SD] ecriture mesuree: %.2f Mo/s\n", sdMbPerSec);
+  free(blk);
+
+  if (ms) sdMbPerSec = (written / 1048576.0f) * 1000.0f / ms;
+  Serial.printf("[SD] ecriture mesuree: %.2f Mo/s par blocs de %u ko\n",
+                sdMbPerSec, (unsigned)(blockLen / 1024));
 }
 
 /* ------------------------ enregistrement ----------------------------- */
@@ -521,17 +534,25 @@ void setup() {
   sdReady = initSD();
 
 #if SD_BENCH
-  benchSD();
+  /* Une capture suffit a connaitre la taille d'une image, donc le debit
+   * exige : si la carte est en dessous, autant le savoir avant le match. */
   {
-    /* Une capture suffit a connaitre la taille d'une image, donc le debit
-     * exige : si la carte est en dessous, autant le savoir avant le match. */
+    uint32_t flen = 0;
+    uint16_t fw = 0, fh = 0;
     camera_fb_t* fb = esp_camera_fb_get();
-    if (fb) {
-      const float need = (float)fb->len * REC_FPS / 1048576.0f;
-      esp_camera_fb_return(fb);
+    if (fb) { flen = fb->len; fw = fb->width; fh = fb->height; esp_camera_fb_return(fb); }
+    benchSD(flen);
+    if (flen) {
+      const float need = (float)flen * REC_FPS / 1048576.0f;
+      const float ok   = need * 1.3f;            // 30 % de marge
       Serial.printf("[SD] l'enregistrement demande %.2f Mo/s%s\n", need,
-                    (sdMbPerSec > 0.0f && sdMbPerSec < need * 1.2f)
-                      ? "  <-- carte trop lente, baisser REC_FPS" : "");
+                    (sdMbPerSec > 0.0f && sdMbPerSec < ok)
+                      ? "  <-- carte trop lente, baisser REC_FPS ou FRAME_SIZE" : "");
+      if (sdMbPerSec > 0.0f) {
+        Serial.printf("[SD] cette carte tient environ %.1f images/s a %ux%u\n",
+                      sdMbPerSec * 1048576.0f / (flen * 1.3f),
+                      (unsigned)fw, (unsigned)fh);
+      }
     }
   }
 #endif
@@ -539,7 +560,9 @@ void setup() {
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
   WiFi.setHostname(HOSTNAME);
-  WiFi.setAutoReconnect(true);
+  /* Pas de setAutoReconnect : le pilote relancerait ses propres tentatives
+   * en parallele de celles de loop(), et chaque begin() tomberait alors
+   * sur "sta is connecting, return error". */
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   Serial.printf("[WIFI] %s", WIFI_SSID);
   const uint32_t t0 = millis();
@@ -549,7 +572,12 @@ void setup() {
     Serial.print("[WIFI] http://"); Serial.println(WiFi.localIP());
     announceMdns();
   } else {
-    Serial.println("[WIFI] hotspot injoignable - nouvelles tentatives en arriere-plan");
+    /* Le pilote continue d'essayer apres notre delai : sans cet arret, la
+     * tentative suivante se superpose et il repond "sta is connecting,
+     * return error". Meme correctif que dans esp32_cam_recorder. */
+    WiFi.disconnect(false);
+    Serial.printf("[WIFI] %s injoignable - nouvelle tentative toutes les %u s\n",
+                  WIFI_SSID, (unsigned)(STA_RETRY_MS / 1000));
   }
 
   server.on("/",         handleRoot);
@@ -569,7 +597,10 @@ void loop() {
   recordTick();
 
   /* Le hotspot est souvent allume apres la carte, et Android le coupe
-     quand plus personne n'est connecte : on reessaie sans abandonner. */
+     quand plus personne n'est connecte : on reessaie sans abandonner.
+     Mais chaque tentative fait scanner la radio, partagee avec la camera
+     - c'est ce qui produisait les cam_hal: EV-VSYNC-OVF toutes les
+     secondes. D'ou l'intervalle large et l'arret avant chaque relance. */
   static uint32_t lastTry = 0;
   static bool wasUp = false;
   if (WiFi.status() == WL_CONNECTED) {
@@ -578,9 +609,10 @@ void loop() {
       Serial.print("[WIFI] connecte, http://"); Serial.println(WiFi.localIP());
       announceMdns();
     }
-  } else if (millis() - lastTry > 20000) {
-    wasUp = false;
+  } else if (millis() - lastTry > STA_RETRY_MS) {
+    if (wasUp) { wasUp = false; Serial.println("[WIFI] lien perdu"); }
     lastTry = millis();
+    Serial.printf("[WIFI] tentative vers %s\n", WIFI_SSID);
     WiFi.disconnect(false);
     WiFi.begin(WIFI_SSID, WIFI_PASS);
   }
