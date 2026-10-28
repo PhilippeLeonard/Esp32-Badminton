@@ -28,15 +28,90 @@ def read_header(f):
         raise SystemExit("magie %r inattendue (ce n'est pas un .rgb de la carte)" % h[:4])
     ver, fmt, w, hgt, fps = struct.unpack_from("<HHHHH", h, 4)
     frames = struct.unpack_from("<I", h, 16)[0]
-    if fmt != 0:
-        raise SystemExit("format %d inconnu (0 = RGB565 attendu)" % fmt)
-    return ver, w, hgt, fps, frames
+    if fmt not in (0, 1):
+        raise SystemExit("format %d inconnu (0 = RGB565, 1 = JPEG)" % fmt)
+    return ver, fmt, w, hgt, fps, frames
 
 
 def frame_count(path, w, h):
     body = os.path.getsize(path) - HEADER
     per = w * h * 2
     return body // per, body % per, per
+
+
+def jpeg_index(f):
+    """[(offset, longueur)] des images JPEG, chacune precedee de sa
+    longueur sur 4 octets. Une derniere image tronquee par une coupure est
+    ignoree : c'est tout l'interet du prefixe."""
+    f.seek(0, os.SEEK_END)
+    end = f.tell()
+    f.seek(HEADER)
+    out, pos = [], HEADER
+    while pos + 4 <= end:
+        f.seek(pos)
+        (ln,) = struct.unpack("<I", f.read(4))
+        if ln == 0 or ln > 4 * 1024 * 1024 or pos + 4 + ln > end:
+            break                      # queue incomplete
+        out.append((pos + 4, ln))
+        pos += 4 + ln
+    return out, end - pos
+
+
+def write_mjpg_avi(out, f, idx, w, h, fps):
+    """AVI MJPEG : les images sont deja du JPEG, on les recopie telles
+    quelles. L'index est bati ici, sur le PC, ou une coupure de courant
+    n'est plus un probleme."""
+    movi = sum(8 + ln + (ln & 1) for _, ln in idx)
+    n = len(idx)
+    biggest = max((ln for _, ln in idx), default=0)
+
+    def tag(s, v):
+        return s + struct.pack('<I', v)
+
+    hdr = bytearray(224)
+    def put(off, data):
+        hdr[off:off + len(data)] = data
+    put(0, tag(b'RIFF', 216 + movi + 8 + 16 * n)); put(8, b'AVI ')
+    put(12, tag(b'LIST', 192)); put(20, b'hdrl')
+    put(24, tag(b'avih', 56))
+    put(32, struct.pack('<I', 1000000 // (fps or 1)))
+    put(36, struct.pack('<I', biggest * (fps or 1)))
+    put(44, struct.pack('<I', 0x10))
+    put(48, struct.pack('<I', n))
+    put(56, struct.pack('<I', 1))
+    put(60, struct.pack('<I', biggest))
+    put(64, struct.pack('<II', w, h))
+    put(88, tag(b'LIST', 116)); put(96, b'strl')
+    put(100, tag(b'strh', 56))
+    put(108, b'vids'); put(112, b'MJPG')
+    put(128, struct.pack('<I', 1))
+    put(132, struct.pack('<I', fps or 1))
+    put(140, struct.pack('<I', n))
+    put(144, struct.pack('<I', biggest))
+    put(148, struct.pack('<I', 0xFFFFFFFF))
+    put(156, struct.pack('<HHHH', 0, 0, w, h))
+    put(164, tag(b'strf', 40))
+    put(172, struct.pack('<IiiHH', 40, w, h, 1, 24))
+    put(188, b'MJPG'); put(192, struct.pack('<I', w * h * 3))
+    put(212, tag(b'LIST', 4 + movi)); put(220, b'movi')
+
+    o = open(out, 'wb')
+    o.write(bytes(hdr))
+    index = bytearray()
+    off = 4
+    for pos, ln in idx:
+        f.seek(pos)
+        data = f.read(ln)
+        o.write(b'00dc' + struct.pack('<I', ln))
+        o.write(data)
+        if ln & 1:
+            o.write(bytes(1))            # les morceaux RIFF sont alignes
+        index += b'00dc' + struct.pack('<III', 0x10, off, ln)
+        off += 8 + ln + (ln & 1)
+    o.write(b'idx1' + struct.pack('<I', 16 * n))
+    o.write(bytes(index))
+    o.close()
+    print("  -> %s : %d images, %dx%d, %d i/s" % (out, n, w, h, fps))
 
 
 def to_rgb888(buf, swap):
@@ -137,7 +212,51 @@ def main():
     swap = "--swap" in args
     flip = "--flip" in args
     with open(path, "rb") as f:
-        ver, w, h, fps, declared = read_header(f)
+        ver, fmt, w, h, fps, declared = read_header(f)
+
+        if fmt == 1:                   # JPEG prefixe de sa longueur
+            idx, rest = jpeg_index(f)
+            n = len(idx)
+            print("%s : v%d, %dx%d, %d i/s, JPEG"
+                  % (os.path.basename(path), ver, w, h, fps))
+            print("  %d images (%.1f s), %.2f Mo"
+                  % (n, n / float(fps or 1),
+                     sum(ln for _, ln in idx) / 1048576.0))
+            if rest:
+                print("  %d octets de queue : derniere image incomplete, ignoree" % rest)
+            if "--avi" in args:
+                write_mjpg_avi(args[args.index("--avi") + 1], f, idx, w, h, fps or 10)
+            if "--png" in args:
+                outdir = os.path.splitext(path)[0] + "_jpg"
+                os.makedirs(outdir, exist_ok=True)
+                want = []
+                for a in args[args.index("--png") + 1:]:
+                    if a.startswith("--"):
+                        break
+                    want.append(int(a))
+                for i in want:
+                    if i >= n:
+                        print("  image %d absente" % i)
+                        continue
+                    pos, ln = idx[i]
+                    f.seek(pos)
+                    q = os.path.join(outdir, "f%05d.jpg" % i)
+                    open(q, "wb").write(f.read(ln))
+                    print("  ->", q)
+            if "--mp4" in args:
+                import subprocess
+                out = args[args.index("--mp4") + 1]
+                cmd = ["ffmpeg", "-y", "-f", "image2pipe", "-vcodec", "mjpeg",
+                       "-r", str(fps or 10), "-i", "-", "-pix_fmt", "yuv420p", out]
+                print("  ", " ".join(cmd))
+                pr = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+                for pos, ln in idx:
+                    f.seek(pos)
+                    pr.stdin.write(f.read(ln))
+                pr.stdin.close()
+                pr.wait()
+            return
+
         n, rest, per = frame_count(path, w, h)
         print("%s : v%d, %dx%d, %d i/s" % (os.path.basename(path), ver, w, h, fps))
         print("  %d images completes (%.1f s), entete annonce %s"
