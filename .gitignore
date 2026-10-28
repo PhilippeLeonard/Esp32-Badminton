@@ -12,3 +12,6 @@ android-app/
 *.gray
 *.avi
 *.apk
+
+# Etat du match tenu par serveur.py
+match.json

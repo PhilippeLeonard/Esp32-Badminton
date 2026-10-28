@@ -27,6 +27,7 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <esp_wifi.h>
+#include <ESPmDNS.h>
 #include "FS.h"
 #include "SD_MMC.h"
 #include "app_page.h"       // generated from phone_app.html by make_page.py
@@ -34,7 +35,7 @@
 /* Version announced in /motion. The page carries its own copy and says
  * so when the two differ: that means the page being viewed did not come
  * from the firmware that is running. */
-#define FW_VERSION "1.1.0"
+#define FW_VERSION "1.2.0"
 
 /* ------------------------- 1. Network ------------------------------- */
 static const char* WIFI_SSID = "Philphone";   // 2.4 GHz hotspot
@@ -43,11 +44,16 @@ static const char* HOSTNAME  = "esp32cam";
 
 /* The board also runs its own access point, always at 192.168.4.1.
  * Connecting the phone straight to it takes the hotspot - and its
- * latency - out of the path. AP_ONLY skips the hotspot entirely. */
-#define AP_ENABLED   1
+ * latency - out of the path. AP_ONLY skips the hotspot entirely.
+ *
+ * Mais l AP et la station partagent la meme radio : des que la station
+ * s associe, l AP est tire sur le canal du hotspot et le telephone
+ * deja connecte a ESP32-CAM est ejecte. Pour un usage par le hotspot,
+ * AP_ENABLED reste a 0 ; le mettre a 1 n a d interet que pour joindre
+ * la carte sans hotspot du tout. */
+#define AP_ENABLED   0   // 1 = AP + station; voir la note ci-dessus
 #define AP_ONLY      0
-#define STA_RETRY_MS 60000   // intervalle entre deux tentatives de hotspot
-#define STA_MAX_TRY  5       // au-dela, on abandonne et on laisse l'AP tranquille
+#define STA_RETRY_MS 20000   // intervalle entre deux tentatives de hotspot
 static const char* AP_SSID = "ESP32-CAM";
 static const char* AP_PASS = "camera123";     // at least 8 characters
 
@@ -56,7 +62,6 @@ static const char* AP_PASS = "camera123";     // at least 8 characters
 #define MOTION_HZ         10              // comparisons per second
 #define MOTION_THRESHOLD  30              // per-pixel |live - reference|, 0..255
 #define REF_AVERAGE       8               // frames averaged into the reference
-#define MASK_DENOISE      1               // drop isolated pixels (sensor noise)
 
 /* ------------------------- 3. Event shape --------------------------- *
  * A burst is NOT fired by movement alone - a hand left in frame would
@@ -75,7 +80,7 @@ static const char* AP_PASS = "camera123";     // at least 8 characters
 #define BURST_FRAMES      20              // frames kept per event
 #define BURST_FPS         10
 #define BURST_FRAME_MAX   24576           // PSRAM reserved per burst frame
-#define BURST_QUALITY     12              // JPEG quality of the stored frames
+#define BURST_QUALITY     8               // JPEG quality of the stored frames
 
 /* ------------------------- 4. Camera pins --------------------------- */
 /* Freenove ESP32-WROVER CAM (same map as the WROVER-KIT OV2640 board). */
@@ -95,7 +100,11 @@ static const char* AP_PASS = "camera123";     // at least 8 characters
 #define VSYNC_GPIO_NUM   25
 #define HREF_GPIO_NUM    23
 #define PCLK_GPIO_NUM    22
-#define XCLK_FREQ_HZ     20000000
+/* 10 MHz, pas 20 : en RGB565 une trame QVGA fait 150 ko ecrits en DMA
+ * dans la PSRAM, et a 20 MHz le controleur n arrive plus a suivre - le
+ * driver crache alors EV-EOF-OVF / EV-VSYNC-OVF en continu et la radio
+ * est noyee avec. En niveaux de gris (75 ko) 20 MHz passait. */
+#define XCLK_FREQ_HZ     10000000
 #define PREVIEW_QUALITY  12               // JPEG quality for /snapshot only
 
 /* ------------------------- 5. Raw recording -------------------------- *
@@ -118,9 +127,12 @@ static const char REC_MAGIC[4] = { 'E', 'S', 'P', 'G' };
 WebServer server(80);
 
 /* --- frame buffers (PSRAM) --- */
+static uint32_t  staLastTry = 0;       // date de la derniere tentative
+static bool      staWasUp   = false;   // etat annonce au dernier passage
+
 static uint8_t*  refBuf   = nullptr;   // the reference still
 static uint8_t*  maskBuf  = nullptr;   // working mask, 0x00 or 0xFF
-static uint8_t*  workBuf  = nullptr;   // denoise scratch
+static uint8_t*  lumaBuf  = nullptr;   // luminance de l'image courante
 static uint8_t*  prevBuf  = nullptr;   // previous frame, for inter-frame motion
 static bool      havePrev = false;
 static uint8_t*  rleBuf   = nullptr;   // encoder output
@@ -140,7 +152,6 @@ static float    rawPct         = 0.0f;   // the same figure, unsmoothed
 static float    pctHist[PCT_AVERAGE];    // the last few measurements
 static uint8_t  pctCount       = 0;
 static uint8_t  pctIndex       = 0;
-static float    refPct         = 0.0f;   // difference from the reference
 static uint32_t nextMotionMs   = 0;
 
 /* --- event state machine ---
@@ -245,7 +256,7 @@ static bool initCamera() {
   c.pin_sccb_sda = SIOD_GPIO_NUM; c.pin_sccb_scl = SIOC_GPIO_NUM;
   c.pin_pwdn  = PWDN_GPIO_NUM;  c.pin_reset = RESET_GPIO_NUM;
   c.xclk_freq_hz = XCLK_FREQ_HZ;
-  c.pixel_format = PIXFORMAT_GRAYSCALE;   // raw pixels: nothing to decode
+  c.pixel_format = PIXFORMAT_RGB565;      // couleur, et acces direct aux pixels
   c.frame_size   = FRAME_SIZE;
   c.jpeg_quality = PREVIEW_QUALITY;
   c.grab_mode    = CAMERA_GRAB_LATEST;
@@ -302,23 +313,24 @@ static void lockExposure(bool on) {
 
 /* ------------------------- buffers ----------------------------------- */
 static bool ensureBuffers(camera_fb_t* fb) {
-  if (grayLen == fb->len && refBuf) return true;
+  if (grayLen == (size_t)fb->width * fb->height && refBuf) return true;
 
-  free(refBuf); free(maskBuf); free(workBuf); free(prevBuf); free(rleBuf); free(burstBuf);
-  refBuf = maskBuf = workBuf = prevBuf = rleBuf = burstBuf = nullptr;
+  free(refBuf); free(maskBuf); free(lumaBuf); free(prevBuf); free(rleBuf); free(burstBuf);
+  refBuf = maskBuf = lumaBuf = prevBuf = rleBuf = burstBuf = nullptr;
   haveRef = havePrev = false;
 
-  grayLen = fb->len; grayW = fb->width; grayH = fb->height;
+  grayW = fb->width; grayH = fb->height;
+  grayLen = (size_t)grayW * grayH;        // la luminance, pas la trame RGB565
   rleCap  = grayLen * 2 + 16;              // worst case: alternating pixels
 
   refBuf   = (uint8_t*)ps_malloc(grayLen);
   maskBuf  = (uint8_t*)ps_malloc(grayLen);
-  workBuf  = (uint8_t*)ps_malloc(grayLen);
+  lumaBuf  = (uint8_t*)ps_malloc(grayLen);
   prevBuf  = (uint8_t*)ps_malloc(grayLen);
   rleBuf   = (uint8_t*)ps_malloc(rleCap);
   burstBuf = (uint8_t*)ps_malloc((size_t)BURST_FRAMES * BURST_FRAME_MAX);
 
-  if (!refBuf || !maskBuf || !workBuf || !prevBuf || !rleBuf || !burstBuf) {
+  if (!refBuf || !maskBuf || !lumaBuf || !prevBuf || !rleBuf || !burstBuf) {
     lastError = "Out of PSRAM";
     Serial.println("[MEM] allocation failed");
     grayLen = 0;
@@ -345,7 +357,8 @@ static bool captureReference() {
   uint32_t* acc = (uint32_t*)ps_malloc(grayLen * sizeof(uint32_t));
   if (!acc) { esp_camera_fb_return(fb); lastError = "Out of PSRAM"; return false; }
 
-  for (size_t i = 0; i < grayLen; i++) acc[i] = fb->buf[i];
+  toLuma(fb);
+  for (size_t i = 0; i < grayLen; i++) acc[i] = lumaBuf[i];
   esp_camera_fb_return(fb);
 
   uint8_t used = 1;
@@ -353,8 +366,9 @@ static bool captureReference() {
     delay(40);
     camera_fb_t* f = esp_camera_fb_get();
     if (!f) continue;
-    if (f->len == grayLen) {
-      for (size_t i = 0; i < grayLen; i++) acc[i] += f->buf[i];
+    if ((size_t)f->width * f->height == grayLen) {
+      toLuma(f);
+      for (size_t i = 0; i < grayLen; i++) acc[i] += lumaBuf[i];
       used++;
     }
     esp_camera_fb_return(f);
@@ -373,6 +387,17 @@ static bool captureReference() {
   return true;
 }
 
+/* RGB565 -> luminance. Le capteur donne de la couleur pour les images de
+   rafale ; la detection, elle, ne travaille que sur la luminance. */
+static void toLuma(camera_fb_t* fb) {
+  const uint8_t* p = fb->buf;
+  for (size_t i = 0; i < grayLen; i++) {
+    const uint16_t px = (uint16_t)(p[i * 2] << 8) | p[i * 2 + 1];
+    const uint8_t r = (px >> 11) & 0x1F, g = (px >> 5) & 0x3F, b = px & 0x1F;
+    lumaBuf[i] = (uint8_t)(((r << 3) * 77 + (g << 2) * 150 + (b << 3) * 29) >> 8);
+  }
+}
+
 /* Percentage of pixels that differ from the PREVIOUS frame.
  *
  * This is what drives the event logic, and it has to be inter-frame
@@ -380,60 +405,38 @@ static bool captureReference() {
  * reference comparison permanently high, so the event would never close
  * and the burst would fire again and again. Compared frame to frame, the
  * same motionless hand reads 0% - movement is movement, presence is not. */
-static float interFrameMotion(camera_fb_t* fb) {
-  if (fb->len != grayLen) return 0.0f;
+static float interFrameMotion() {
   if (!havePrev) {
-    memcpy(prevBuf, fb->buf, grayLen);
+    memcpy(prevBuf, lumaBuf, grayLen);
     havePrev = true;
     return 0.0f;
   }
   const uint8_t thr = threshold;
   uint32_t moved = 0;
   for (size_t i = 0; i < grayLen; i++) {
-    const int d = (int)fb->buf[i] - (int)prevBuf[i];
+    const int d = (int)lumaBuf[i] - (int)prevBuf[i];
     if ((d < 0 ? -d : d) > thr) moved++;
   }
-  memcpy(prevBuf, fb->buf, grayLen);
+  memcpy(prevBuf, lumaBuf, grayLen);
   return 100.0f * (float)moved / (float)grayLen;
 }
 
 /* Compare to the reference. Fills maskBuf with 0x00 (changed) / 0xFF
  * (unchanged) and returns the percentage of changed pixels. This is the
  * picture the burst carries: it shows the SHAPE of whatever is there. */
-static float buildMask(camera_fb_t* fb) {
-  if (!haveRef || fb->len != grayLen) return 0.0f;
+/* Remplit maskBuf, et rien de plus. L'erosion des pixels isoles et le
+ * comptage des pixels changes se font dans la page, sur le masque
+ * qu'elle recoit de toute facon : c'etait deux passes completes et deux
+ * recopies de 76 ko sur la carte, pour une vue qu'on ne regarde que par
+ * moments. */
+static void buildMask() {
+  if (!haveRef) return;
 
   const uint8_t thr = threshold;
-  uint32_t changed = 0;
   for (size_t i = 0; i < grayLen; i++) {
-    const int d = (int)fb->buf[i] - (int)refBuf[i];
-    const bool diff = ((d < 0 ? -d : d) > thr);
-    maskBuf[i] = diff ? 0x00 : 0xFF;
+    const int d = (int)lumaBuf[i] - (int)refBuf[i];
+    maskBuf[i] = ((d < 0 ? -d : d) > thr) ? 0x00 : 0xFF;
   }
-
-#if MASK_DENOISE
-  /* A black pixel with fewer than two black neighbours is sensor noise,
-   * not an object. Done into a separate buffer so the erosion does not
-   * cascade into itself as it walks the image. */
-  memcpy(workBuf, maskBuf, grayLen);
-  for (uint16_t y = 1; y + 1 < grayH; y++) {
-    const size_t row = (size_t)y * grayW;
-    for (uint16_t x = 1; x + 1 < grayW; x++) {
-      const size_t i = row + x;
-      if (maskBuf[i]) continue;
-      uint8_t n = 0;
-      if (!maskBuf[i - 1])     n++;
-      if (!maskBuf[i + 1])     n++;
-      if (!maskBuf[i - grayW]) n++;
-      if (!maskBuf[i + grayW]) n++;
-      if (n < 2) workBuf[i] = 0xFF;
-    }
-  }
-  memcpy(maskBuf, workBuf, grayLen);
-#endif
-
-  for (size_t i = 0; i < grayLen; i++) if (!maskBuf[i]) changed++;
-  return 100.0f * (float)changed / (float)grayLen;
 }
 
 /* ---------------------- encoders ------------------------------------- */
@@ -591,13 +594,13 @@ static void stopRawRecording() {
 
 /* Writes the frame the detection has just looked at: one grab serves
  * both, so recording costs no extra capture. */
-static void recordRaw(camera_fb_t* fb) {
+static void recordRaw() {
   if (!recOn) return;
   const uint32_t now = millis();
   if ((int32_t)(now - recNextMs) < 0) return;
   recNextMs = now + 1000UL / REC_FPS;
 
-  if (recFile.write(fb->buf, fb->len) != fb->len) {
+  if (recFile.write(lumaBuf, grayLen) != grayLen) {
     Serial.println("[RAW] SD write failed - card full?");
     lastError = "SD write failed (card full?)";
     stopRawRecording();
@@ -620,7 +623,7 @@ static void ringPush(camera_fb_t* fb) {
   uint8_t* jpg = nullptr;
   size_t   len = 0;
   if (!fmt2jpg(fb->buf, fb->len, fb->width, fb->height,
-               PIXFORMAT_GRAYSCALE, BURST_QUALITY, &jpg, &len)) return;
+               PIXFORMAT_RGB565, BURST_QUALITY, &jpg, &len)) return;
 
   if (len <= BURST_FRAME_MAX) {
     memcpy(burstBuf + (size_t)ringPos * BURST_FRAME_MAX, jpg, len);
@@ -656,21 +659,24 @@ static void motionTick() {
   if (!ensureBuffers(fb)) { esp_camera_fb_return(fb); return; }
   if (!haveRef) { esp_camera_fb_return(fb); return; }
 
-  recordRaw(fb);                      // same grab feeds the recording
+  recordRaw();                        // meme capture, luminance enregistree
 
   /* Rolling average over the last few measurements. Frame-to-frame
    * movement is naturally spiky - a shuttle crossing the frame reads
    * 10, 20, 0, 10, 30 - and a single stray low reading in the middle of
    * real movement was enough to start closing the event. Averaging costs
    * nothing and removes that whole class of false ending. */
-  rawPct = interFrameMotion(fb);
+  toLuma(fb);
+  rawPct = interFrameMotion();
   pctHist[pctIndex] = rawPct;
   pctIndex = (pctIndex + 1) % PCT_AVERAGE;
   if (pctCount < PCT_AVERAGE) pctCount++;
   float sum = 0.0f;
   for (uint8_t i = 0; i < pctCount; i++) sum += pctHist[i];
   lastPct = sum / pctCount;           // drives the state machine
-  refPct  = buildMask(fb);            // the mask, for the on-demand view
+
+  /* Le masque ne sert qu'a la vue "regarder" : il est construit quand la
+     page le demande, pas dix fois par seconde pour personne. */
 
   switch (evtState) {
 
@@ -736,10 +742,10 @@ static void handleRoot() { server.send_P(200, "text/html", APP_PAGE); }
 static void handleMotion() {
   char j[256];
   snprintf(j, sizeof(j),
-           "{\"ver\":\"" FW_VERSION "\",\"pct\":%.2f,\"rawpct\":%.2f,\"refpct\":%.2f,\"move\":%.2f,\"calm\":%.2f,\"minms\":%u,\"thr\":%u,"
+           "{\"ver\":\"" FW_VERSION "\",\"pct\":%.2f,\"rawpct\":%.2f,\"move\":%.2f,\"calm\":%.2f,\"minms\":%u,\"thr\":%u,"
            "\"ref\":%s,\"lock\":%s,\"state\":%u,\"active\":%u,\"n\":%u,"
            "\"events\":%u,\"sd\":%s,\"rec\":%s,\"recn\":%u,\"recfile\":\"%s\",\"w\":%u,\"h\":%u,\"file\":\"%s\"}",
-           lastPct, rawPct, refPct, movePct, calmPct, (unsigned)minActiveMs, (unsigned)threshold,
+           lastPct, rawPct, movePct, calmPct, (unsigned)minActiveMs, (unsigned)threshold,
            haveRef ? "true" : "false",
            exposureLocked ? "true" : "false",
            (unsigned)evtState,
@@ -841,7 +847,7 @@ static void handleSnapshot() {
   if (!fb) { server.send(503, "text/plain", "capture failed"); return; }
   uint8_t* jpg = nullptr; size_t len = 0;
   const bool ok = fmt2jpg(fb->buf, fb->len, fb->width, fb->height,
-                          PIXFORMAT_GRAYSCALE, PREVIEW_QUALITY, &jpg, &len);
+                          PIXFORMAT_RGB565, PREVIEW_QUALITY, &jpg, &len);
   esp_camera_fb_return(fb);
   if (!ok) { server.send(503, "text/plain", "encode failed"); return; }
   cors();
@@ -880,7 +886,8 @@ static void handleMask() {
   camera_fb_t* fb = esp_camera_fb_get();
   if (!fb) { server.send(503, "text/plain", "capture failed"); return; }
   if (!ensureBuffers(fb)) { esp_camera_fb_return(fb); server.send(500, "text/plain", "no memory"); return; }
-  refPct = buildMask(fb);   // on-demand view: does not touch the motion figure
+  toLuma(fb);
+  buildMask();              // vue a la demande : ne touche pas au chiffre de mouvement
   esp_camera_fb_return(fb);
 
   const size_t len = encodeRuns(maskBuf);
@@ -964,6 +971,21 @@ static void handleDelete() {
 }
 
 /* ----------------------------- setup --------------------------------- */
+/* Le hotspot redistribue un bail different a chaque redemarrage, donc
+   l'adresse notee dans la page devient fausse. Le nom, lui, ne change
+   pas : http://esp32cam.local */
+static void announceMdns() {
+  static bool mdnsUp = false;
+  if (mdnsUp) return;
+  if (MDNS.begin(HOSTNAME)) {
+    MDNS.addService("http", "tcp", 80);
+    mdnsUp = true;
+    Serial.printf("[MDNS] http://%s.local\n", HOSTNAME);
+  } else {
+    Serial.println("[MDNS] demarrage impossible");
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   delay(300);
@@ -1001,15 +1023,23 @@ void setup() {
     Serial.print('.');
   }
   Serial.println();
+  staLastTry = millis();
   if (WiFi.status() == WL_CONNECTED) {
     esp_wifi_set_ps(WIFI_PS_NONE);     // must be after association to stick
     wifi_ps_type_t ps = WIFI_PS_NONE;
     esp_wifi_get_ps(&ps);
     Serial.print("[WIFI] open http://");
     Serial.println(WiFi.localIP());
+    announceMdns();
+    staWasUp = true;
     Serial.printf("[WIFI] RSSI %d dBm, ps=%d (0 = none)\n", WiFi.RSSI(), (int)ps);
   } else {
-    Serial.println("[WIFI] hotspot not joined - the board's own AP still works");
+    /* Le driver continue d'essayer en arriere-plan apres notre timeout :
+       sans cet arret, la tentative suivante se superpose et le driver
+       repond "sta is connecting, return error". */
+    WiFi.disconnect(false);
+    Serial.printf("[WIFI] %s injoignable - nouvelle tentative toutes les %u s\n",
+                  WIFI_SSID, (unsigned)(STA_RETRY_MS / 1000));
   }
 #endif
 
@@ -1039,28 +1069,31 @@ void loop() {
   motionTick();
 
 #if !AP_ONLY
-  /* Reessayer toutes les 10 s etait destructeur : chaque tentative fait
-     scanner la radio, partagee avec l'AP, donc l'AP et le serveur web
-     etaient perturbes en permanence. On espace, on ne relance jamais une
-     tentative deja en cours, et on abandonne apres quelques echecs. */
-  static uint32_t lastWifiCheck = 0;
-  static uint8_t  staTries = 0;
-  if (millis() - lastWifiCheck > STA_RETRY_MS) {
-    lastWifiCheck = millis();
-    const wl_status_t st = WiFi.status();
-    if (st == WL_CONNECTED) {
+  /* Reessayer sans jamais abandonner : le hotspot du telephone est
+     souvent allume APRES la carte, et Android le coupe tout seul quand
+     plus aucun client n'est connecte. On espace les tentatives (chacune
+     fait scanner la radio, partagee avec l'AP quand celui-ci tourne) et
+     on ne relance jamais avant la fin de l'intervalle. WL_IDLE_STATUS
+     compte comme "pas connecte" : c'est l'etat annonce par le driver
+     apres une deconnexion, et l'ignorer laissait la station endormie
+     pour de bon. */
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!staWasUp) {
+      staWasUp = true;
       esp_wifi_set_ps(WIFI_PS_NONE);
-      staTries = 0;
-    } else if (st != WL_IDLE_STATUS && staTries < STA_MAX_TRY) {
-      staTries++;
-      Serial.printf("[WIFI] tentative %u/%u vers %s\n", staTries, STA_MAX_TRY, WIFI_SSID);
-      WiFi.disconnect(false);
-      WiFi.begin(WIFI_SSID, WIFI_PASS);
-    } else if (staTries >= STA_MAX_TRY) {
-      staTries = STA_MAX_TRY + 1;
-      WiFi.disconnect(true);
-      Serial.println("[WIFI] hotspot injoignable, station arretee - l'AP reste disponible");
+      Serial.print("[WIFI] connecte, http://");
+      Serial.println(WiFi.localIP());
+      announceMdns();
     }
+  } else if (millis() - staLastTry > STA_RETRY_MS) {
+    if (staWasUp) {
+      staWasUp = false;
+      Serial.println("[WIFI] lien perdu");
+    }
+    staLastTry = millis();
+    Serial.printf("[WIFI] tentative vers %s\n", WIFI_SSID);
+    WiFi.disconnect(false);
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
   }
 #endif
 }

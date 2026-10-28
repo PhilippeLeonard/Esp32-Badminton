@@ -123,7 +123,7 @@
 /* Version de cette page. Le firmware annonce la sienne dans /motion :
    si les deux different, la page affichee ne vient pas du firmware qui
    tourne (vieux cache, ou make_page.py pas relance avant de flasher). */
-const APP_VERSION = "1.1.0";
+const APP_VERSION = "1.2.0";
 
 const $ = i => document.getElementById(i);
 const cv = $("cv"), ctx = cv.getContext("2d");
@@ -161,24 +161,62 @@ const host = () => base.replace(/^https?:\/\//, "").replace(/\/.*$/, "");
 const url  = p => "http://" + host() + p;
 const human = b => b > 1048576 ? (b/1048576).toFixed(1) + " Mo" : (b/1024).toFixed(1) + " ko";
 
-/* ---------------- dessin d'un masque run-length ----------------
+/* ---------------- masque run-length ----------------
  * Format : [count][valeur], lu d'affilee, de haut en bas.
  *
  * La valeur suit encodeRuns() cote carte : 1 = pixel INCHANGE (blanc),
  * 0 = pixel CHANGE (noir). L'inverser retourne tout le masque - le fond
- * devient noir et l'objet blanc, ce qui ne ressemble plus a rien. */
-function drawRuns(bytes, w, h) {
-  if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }
-  const img = ctx.createImageData(w, h), p = img.data;
+ * devient noir et l'objet blanc, ce qui ne ressemble plus a rien.
+ *
+ * La carte envoie le masque brut. Le nettoyage et le comptage se font
+ * ici : c'est du travail qu'elle faisait dix fois par seconde pour une
+ * vue qu'on ne regarde que par moments. */
+let maskPct = null;                 // % de pixels changes au dernier masque
+
+function decodeRuns(bytes, n) {
+  const m = new Uint8Array(n);
   let j = 0;
-  for (let o = 0; o + 1 < bytes.length; o += 2) {
-    const run = bytes[o], v = bytes[o+1] ? 255 : 0;     // 1 = inchange = blanc
-    for (let k = 0; k < run && j < w*h; k++, j++) {
-      const i = j*4;
-      p[i] = p[i+1] = p[i+2] = v; p[i+3] = 255;
+  for (let o = 0; o + 1 < bytes.length && j < n; o += 2) {
+    const end = Math.min(j + bytes[o], n);
+    m.fill(bytes[o+1] ? 255 : 0, j, end);
+    j = end;
+  }
+  return m;
+}
+
+/* Un pixel noir avec moins de deux voisins noirs est du bruit de
+   capteur, pas un objet. Erosion dans une copie, sinon elle se propage
+   d'elle-meme en parcourant l'image. */
+function denoise(m, w, h) {
+  const out = m.slice();
+  for (let y = 1; y + 1 < h; y++) {
+    const row = y * w;
+    for (let x = 1; x + 1 < w; x++) {
+      const i = row + x;
+      if (m[i]) continue;
+      let n = 0;
+      if (!m[i-1]) n++;
+      if (!m[i+1]) n++;
+      if (!m[i-w]) n++;
+      if (!m[i+w]) n++;
+      if (n < 2) out[i] = 255;
     }
   }
+  return out;
+}
+
+function drawRuns(bytes, w, h) {
+  const m = denoise(decodeRuns(bytes, w * h), w, h);
+  if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }
+  const img = ctx.createImageData(w, h), p = img.data;
+  let changed = 0;
+  for (let i = 0; i < m.length; i++) {
+    const v = m[i], o = i * 4;
+    if (!v) changed++;
+    p[o] = p[o+1] = p[o+2] = v; p[o+3] = 255;
+  }
   ctx.putImageData(img, 0, 0);
+  maskPct = 100 * changed / m.length;
 }
 
 /* ---------------- etat, interroge plusieurs fois par seconde ---------------- */
@@ -209,8 +247,10 @@ async function poll() {
   $("pct").textContent = S.pct.toFixed(2) + " %";
   /* Le gros chiffre est la moyenne : c'est elle qui pilote la machine a
      etats. La mesure brute est rappelee a cote pour voir l'ecart. */
+  /* "vs reference" vient du dernier masque recu, pas de la carte : elle
+     ne compare plus a la reference tant qu'on ne regarde pas. */
   $("refpct").textContent = "brut " + (S.rawpct ?? 0).toFixed(2) + " %"
-    + "  ·  vs reference " + (S.refpct ?? 0).toFixed(2) + " %";
+    + (maskPct === null ? "" : "  ·  vs reference " + maskPct.toFixed(2) + " % (dernier masque)");
   $("fill").style.width = Math.min(100, S.pct * 3) + "%";
   $("mark").style.left  = Math.min(100, S.move * 3) + "%";
   $("fill").style.background = S.pct >= S.move ? "var(--stop)" : "var(--accent)";

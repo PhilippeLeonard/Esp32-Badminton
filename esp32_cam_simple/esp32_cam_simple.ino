@@ -3,7 +3,8 @@
  * La carte rejoint le hotspot du telephone et sert une page a deux
  * boutons :
  *   - une image : /shot renvoie un JPEG pris a l'instant
- *   - un enregistrement : /record?on=1 ecrit /rec_NNNN.rgb sur la carte SD,
+ *   - un enregistrement : /record?on=1&fmt=jpg|rgb ecrit /rec_NNNN.mjpg
+ *     ou /rec_NNNN.rgb sur la carte SD,
  *     en couleur et sans aucune compression (RGB565, les octets sortis du
  *     capteur tels quels)
  *
@@ -71,6 +72,18 @@ static const char* AP_PASS = "camera123";     // au moins 8 caracteres
 #define PREVIEW_QUALITY  10              // qualite du JPEG de /shot seulement
 #define XCLK_FREQ_HZ     10000000
 
+/* Deux formats d'enregistrement, choisis a chaque demarrage :
+ *   rgb  : RGB565 brut, aucune perte, indispensable pour rejouer un
+ *          algorithme sur des pixels identiques a ceux du capteur ;
+ *   jpg  : chaque image convertie en JPEG, environ douze fois plus
+ *          leger. Pour regarder un clip ou l'expedier, c'est ce qu'il
+ *          faut : 5 s en QVGA tiennent dans ~300 ko au lieu de 3,75 Mo.
+ * La conversion est logicielle (fmt2jpg) : le capteur reste en RGB565,
+ * donc /shot et la photo ne changent pas. Elle coute ~30 ms par image en
+ * QVGA, ce qui tient largement a REC_FPS bas. */
+#define REC_JPEG_DEFAULT 1               // 1 = jpg par defaut, 0 = rgb
+#define REC_JPEG_QUALITY 10              // 10 (fin) .. 40 (grossier)
+
 #define REC_MAX_MINUTES  30              // garde-fou de duree
 #define SD_MIN_FREE_MB   20              // marge sous laquelle on coupe
 #define SD_BENCH         1               // mesure le debit de la carte au demarrage
@@ -111,7 +124,11 @@ static float    sdMbPerSec = 0.0f;      // mesure au demarrage, 0 = non mesure
  * a la suite, chacune de width*height*2 octets en RGB565 :
  *    0  "ESPC"    4 o   magie
  *    4  version   u16   1
- *    6  format    u16   0 = RGB565 petit-boutiste
+ *    6  format    u16   0 = RGB565 petit-boutiste, images de taille fixe
+ *                       1 = JPEG, chaque image precedee de sa longueur
+ *                           sur 4 octets (elles n'ont plus la meme taille,
+ *                           leur nombre ne se deduit donc plus de la
+ *                           taille du fichier : on lit jusqu'au bout)
  *    8  width     u16
  *   10  height    u16
  *   12  fps       u16
@@ -130,7 +147,9 @@ static uint32_t recFrames   = 0;
 static uint32_t recDropped  = 0;
 static uint32_t recNextMs   = 0;
 static uint32_t recStartMs  = 0;
-static uint32_t recFrameLen = 0;        // octets par image
+static uint32_t recFrameLen = 0;        // octets par image (RGB565)
+static bool     recJpeg     = REC_JPEG_DEFAULT;
+static uint64_t recBytes    = 0;        // octets d'images reellement ecrits
 static uint16_t recW = 0, recH = 0;
 static uint64_t recFree     = 0;        // place restante estimee, en octets
 static char     recPath[32] = {0};
@@ -268,7 +287,7 @@ static bool startRecording() {
   }
 
   for (uint16_t i = 1; i < 10000; i++) {
-    snprintf(recPath, sizeof(recPath), "/rec_%04u.rgb", i);
+    snprintf(recPath, sizeof(recPath), recJpeg ? "/rec_%04u.mjpg" : "/rec_%04u.rgb", i);
     if (!SD_MMC.exists(recPath)) break;
   }
   recFile = SD_MMC.open(recPath, FILE_WRITE);
@@ -293,7 +312,7 @@ static bool startRecording() {
   memset(h, 0, sizeof(h));
   memcpy(h, "ESPC", 4);
   w16(h + 4, 1);                 // version
-  w16(h + 6, 0);                 // RGB565
+  w16(h + 6, recJpeg ? 1 : 0);   // 0 = RGB565, 1 = JPEG prefixe
   w16(h + 8, recW);
   w16(h + 10, recH);
   w16(h + 12, REC_FPS);
@@ -310,14 +329,16 @@ static bool startRecording() {
 
   recFrames  = 0;
   recDropped = 0;
+  recBytes   = 0;
   recFree    = sdFreeBytes();
   recStartMs = millis();
   recNextMs  = recStartMs;
   recOn      = true;
   lastMsg    = "";
-  Serial.printf("[REC] %s  %ux%u RGB565 @ %d i/s  (%.2f Mo/s)\n",
-                recPath, recW, recH, REC_FPS,
-                recFrameLen * (float)REC_FPS / 1048576.0f);
+  Serial.printf("[REC] %s  %ux%u %s @ %d i/s  (%.2f Mo/s attendus)\n",
+                recPath, recW, recH, recJpeg ? "JPEG" : "RGB565", REC_FPS,
+                (recJpeg ? recFrameLen / 12.0f : (float)recFrameLen)
+                  * REC_FPS / 1048576.0f);
   return true;
 }
 
@@ -343,7 +364,7 @@ static void stopRecording(const char* why) {
   if (recDropped) lastMsg += ", " + String(recDropped) + " sautees";
   Serial.printf("[REC] %s: %u images en %.1f s, %.1f Mo, %u sautees (%s)\n",
                 recPath, (unsigned)recFrames, secs,
-                (double)recFrames * recFrameLen / 1048576.0,
+                (double)recBytes / 1048576.0,
                 (unsigned)recDropped, why ? why : "arrete");
 }
 
@@ -385,12 +406,38 @@ static void recordTick() {
     return;
   }
 
-  const bool ok = recFile.write(fb->buf, recFrameLen) == recFrameLen;
+  bool     ok    = false;
+  uint32_t wrote = 0;
+
+  if (recJpeg) {
+    /* Le capteur reste en RGB565 : on convertit juste avant d'ecrire.
+       La longueur precede chaque image, sinon un fichier d'images de
+       tailles differentes ne se relit pas apres une coupure. */
+    uint8_t* jpg = nullptr;
+    size_t   len = 0;
+    if (fmt2jpg(fb->buf, fb->len, fb->width, fb->height,
+                PIXFORMAT_RGB565, REC_JPEG_QUALITY, &jpg, &len)) {
+      uint8_t pre[4];
+      w32(pre, (uint32_t)len);
+      ok = recFile.write(pre, 4) == 4 && recFile.write(jpg, len) == len;
+      wrote = 4 + (uint32_t)len;
+      free(jpg);
+    } else {
+      esp_camera_fb_return(fb);
+      recDropped++;                     // conversion ratee : image sautee
+      return;
+    }
+  } else {
+    ok    = recFile.write(fb->buf, recFrameLen) == recFrameLen;
+    wrote = recFrameLen;
+  }
+
   esp_camera_fb_return(fb);
   if (!ok) { stopRecording("ecriture SD en echec"); return; }
 
   recFrames++;
-  recFree -= recFrameLen;
+  recBytes += wrote;
+  recFree  -= wrote;
   /* Une vidange par seconde : la FAT suit la taille reelle, donc une
    * coupure ne coute qu'une seconde d'images, jamais le fichier. */
   if (recFrames % REC_FPS == 0) recFile.flush();
@@ -413,6 +460,7 @@ static const char PAGE[] PROGMEM = R"HTML(<!doctype html>
 <h2>ESP32 CAM</h2>
 <button onclick="shot()">Prendre une image</button>
 <button id="rb" onclick="rec()">Demarrer l'enregistrement</button>
+<label id="fl"><input type="checkbox" id="jp" checked> JPEG (12x plus leger)</label>
 <img id="im" alt="">
 <div id="st">...</div>
 <p><a href="#" onclick="fetch('/wifi').then(st);return false">reessayer le hotspot</a></p>
@@ -421,12 +469,18 @@ static const char PAGE[] PROGMEM = R"HTML(<!doctype html>
 const g=i=>document.getElementById(i);
 let on=false;
 function shot(){g('im').src='/shot?t='+Date.now();}
-function rec(){fetch('/record?on='+(on?0:1)).then(st);}
+function rec(){
+  var f=document.getElementById('jp').checked?'jpg':'rgb';
+  fetch('/record?on='+(on?0:1)+'&fmt='+f).then(st);
+}
 function st(){
   fetch('/status').then(r=>r.json()).then(s=>{
     on=s.rec;
     g('rb').textContent=on?"Arreter l'enregistrement":"Demarrer l'enregistrement";
     g('rb').className=on?'rec':'';
+    /* Le format ne se change pas en cours d'enregistrement : un fichier
+       melangeant les deux ne se relirait pas. */
+    g('jp').checked=s.jpeg; g('jp').disabled=on;
     g('st').textContent=
       (s.sd?'carte SD ok, '+s.freemb+' Mo libres'+(s.cardmbs?', '+s.cardmbs+' Mo/s':''):'pas de carte SD')+
       '\nenregistrement '+s.w+'x'+s.h+' couleur brute, '+s.fps+' i/s = '+s.needmbs+' Mo/s'+
@@ -475,6 +529,11 @@ static void handleShot() {
 
 static void handleRecordRoute() {
   if (server.arg("on") == "1") {
+    /* Le format se choisit au demarrage seulement : en changer en cours
+       d'enregistrement rendrait le fichier illisible. */
+    const String fmt = server.arg("fmt");
+    if (fmt == "jpg") recJpeg = true;
+    else if (fmt == "rgb") recJpeg = false;
     if (!startRecording()) { cors(); server.send(500, "text/plain", lastMsg); return; }
   } else {
     stopRecording("arrete depuis le telephone");
@@ -490,11 +549,13 @@ static void handleStatus() {
   char j[480];
   snprintf(j, sizeof(j),
            "{\"ver\":\"" FW_VERSION "\",\"sd\":%s,\"rec\":%s,\"frames\":%u,"
-           "\"mb\":%.1f,\"freemb\":%u,\"dropped\":%u,\"file\":\"%s\","
+           "\"mb\":%.1f,\"jpeg\":%s,\"freemb\":%u,\"dropped\":%u,\"file\":\"%s\","
            "\"w\":%u,\"h\":%u,\"fps\":%u,\"needmbs\":\"%.2f\",\"cardmbs\":\"%.2f\","
            "\"ap\":\"%s\",\"ip\":\"%s\",\"msg\":\"%s\"}",
            sdReady ? "true" : "false", recOn ? "true" : "false",
-           (unsigned)recFrames, (double)recFrames * flen / 1048576.0,
+           (unsigned)recFrames,
+           (double)(recBytes ? recBytes : (uint64_t)recFrames * flen) / 1048576.0,
+           recJpeg ? "true" : "false",
            (unsigned)freeMb, (unsigned)recDropped, recOn ? recPath : "",
            (unsigned)recW, (unsigned)recH,
            (unsigned)REC_FPS, flen * (double)REC_FPS / 1048576.0,
@@ -521,7 +582,7 @@ static void handleFiles() {
     while (f) {
       String n = f.name();
       if (n.startsWith("/")) n = n.substring(1);
-      if (n.endsWith(".rgb")) {
+      if (n.endsWith(".rgb") || n.endsWith(".mjpg")) {
         char row[96];
         snprintf(row, sizeof(row), "%s{\"n\":\"%s\",\"s\":%u}",
                  first ? "" : ",", n.c_str(), (unsigned)f.size());

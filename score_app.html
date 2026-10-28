@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="mobile-web-app-capable" content="yes">
+<title>Compteur badminton</title>
+<style>
+  :root{
+    --bg:#101214; --panel:#191d21; --line:#2a3036; --text:#e8eaed; --muted:#9aa4ad;
+    --accent:#2980b9; --go:#27ae60; --stop:#c0392b; --flat:#333b42; --warn:#e67e22;
+  }
+  *{box-sizing:border-box}
+  body{font-family:system-ui,-apple-system,sans-serif;margin:0;padding:12px;
+       background:var(--bg);color:var(--text);max-width:720px;margin-inline:auto}
+  h1{font-size:15px;margin:16px 0 6px;color:var(--muted);font-weight:600;
+     text-transform:uppercase;letter-spacing:.05em}
+  button{font-size:16px;padding:13px 14px;border:0;border-radius:9px;color:#fff;
+         margin:5px 0;width:100%;font-weight:600;background:var(--flat)}
+  button.on{background:var(--accent)}button.go{background:var(--go)}
+  button.stop{background:var(--stop)}
+  .row{display:flex;gap:8px}
+  .st{font-size:13px;color:var(--muted);margin:5px 0}
+  .tableau{display:flex;gap:8px;margin-top:4px}
+  .camp{flex:1;background:var(--panel);border:1px solid var(--line);border-radius:12px;
+        padding:10px;text-align:center}
+  .camp.sert{border-color:var(--go)}
+  .nom{font-size:14px;color:var(--muted);font-weight:600;min-height:18px}
+  .pts{font-size:64px;line-height:1.05;font-weight:700;font-variant-numeric:tabular-nums}
+  .jeux{font-size:13px;color:var(--muted)}
+  .sert .nom:after{content:" · sert";color:var(--go)}
+  .fini{background:var(--go);color:#fff;border-radius:9px;padding:9px;text-align:center;
+        font-weight:700;margin-top:8px}
+  canvas{width:100%;border-radius:10px;background:#000;display:block;aspect-ratio:4/3;
+         border:1px solid var(--line)}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  td,th{padding:6px 5px;border-bottom:1px solid var(--line);text-align:left}
+  th{color:var(--muted);font-weight:600}
+  .manuel{color:var(--warn)}
+  input[type=text],input[type=number],select{background:#0b0d0f;border:1px solid var(--line);
+       color:var(--text);padding:10px;border-radius:7px;font-size:16px;width:100%}
+  input[type=range]{width:100%}
+  .grille{display:grid;grid-template-columns:1fr 1fr;gap:8px;align-items:center}
+  .grille label{font-size:13px;color:var(--muted)}
+  details{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+          padding:8px 10px;margin-top:10px}
+  summary{font-size:14px;color:var(--muted);font-weight:600;cursor:pointer}
+  .conn{display:flex;gap:8px;align-items:center;background:var(--panel);
+        padding:8px 10px;border-radius:9px;font-size:13px;color:var(--muted)}
+  .pastille{width:10px;height:10px;border-radius:50%;background:var(--stop);flex:0 0 auto}
+  .pastille.ok{background:var(--go)}
+</style>
+</head>
+<body>
+
+<div class="conn"><span class="pastille" id="pastille"></span><span id="carte">carte jamais vue</span></div>
+
+<div class="tableau">
+  <div class="camp" id="camp0">
+    <div class="nom" id="nom0">Joueur A</div>
+    <div class="pts" id="pts0">0</div>
+    <div class="jeux" id="jeux0">jeux 0</div>
+  </div>
+  <div class="camp" id="camp1">
+    <div class="nom" id="nom1">Joueur B</div>
+    <div class="pts" id="pts1">0</div>
+    <div class="jeux" id="jeux1">jeux 0</div>
+  </div>
+</div>
+<div id="fini"></div>
+
+<div class="row">
+  <button class="on" id="p0">+1 gauche</button>
+  <button class="on" id="p1">+1 droite</button>
+</div>
+<div class="row">
+  <button id="annuler">Annuler le dernier</button>
+  <button class="stop" id="reset">Nouveau match</button>
+</div>
+
+<h1>Ou tombe le volant</h1>
+<canvas id="cv" width="320" height="240"></canvas>
+<div class="st" id="aide">Les points marques sont les derniers volants detectes. La barre
+  verticale est le filet : si les cotes sont inverses, changez "camp de A".</div>
+
+<details>
+  <summary>Reglages</summary>
+  <div class="grille">
+    <label>Nom gauche</label><input type="text" id="n0">
+    <label>Nom droite</label><input type="text" id="n1">
+    <label>Filet dans l'image</label>
+    <select id="axe"><option value="x">vertical</option><option value="y">horizontal</option></select>
+    <label>Camp de gauche</label>
+    <select id="cote"><option value="min">haut / gauche</option><option value="max">bas / droite</option></select>
+    <label>Position du filet <span id="lv"></span></label><input type="range" id="ligne" min="0" max="320">
+    <label>Jeu en</label><input type="number" id="cible" min="1" max="99">
+    <label>Plafond</label><input type="number" id="plafond" min="1" max="99">
+    <label>Jeux pour gagner</label><input type="number" id="jpg" min="1" max="5">
+  </div>
+</details>
+
+<h1>Journal</h1>
+<table id="journal"><tbody></tbody></table>
+
+<script>
+const $ = i => document.getElementById(i);
+const cv = $("cv"), ctx = cv.getContext("2d");
+let E = null;
+let fige = 0;          // les reglages qu'on vient de toucher ne sont pas ecrases
+
+async function appel(chemin, methode = "POST", corps = null) {
+  const o = { method: methode, cache: "no-store" };
+  if (corps) { o.body = JSON.stringify(corps); o.headers = { "Content-Type": "application/json" }; }
+  const r = await fetch(chemin, o);
+  return r.json();
+}
+
+/* Un seul appel en vol a la fois : c'est le serveur du portable, il repond
+   vite, mais empiler les requetes ne sert jamais a rien. */
+async function boucle() {
+  try { dessiner(await appel("/etat", "GET")); } catch (e) {}
+  setTimeout(boucle, 700);
+}
+
+function dessiner(e) {
+  E = e;
+  const r = e.reglages;
+  for (const j of [0, 1]) {
+    $("nom" + j).textContent  = r.noms[j];
+    $("pts" + j).textContent  = e.score[j];
+    $("jeux" + j).textContent = "jeux " + e.jeux[j];
+    $("camp" + j).className   = "camp" + (e.serveur === j && e.echanges ? " sert" : "");
+  }
+  $("fini").innerHTML = e.fini
+    ? '<div class="fini">' + r.noms[e.vainqueur] + " gagne le match</div>" : "";
+  $("p0").textContent = "+1 " + r.noms[0];
+  $("p1").textContent = "+1 " + r.noms[1];
+
+  const vu = e.carte.depuis;
+  $("pastille").className = "pastille" + (vu !== null && vu < 30 ? " ok" : "");
+  $("carte").textContent = vu === null ? "carte jamais vue"
+    : "carte " + (e.carte.ip || "?") + " vue il y a " + vu.toFixed(0) + " s"
+      + (e.carte.rssi ? "  ·  " + e.carte.rssi + " dBm" : "");
+
+  if (Date.now() > fige) {
+    $("n0").value = r.noms[0]; $("n1").value = r.noms[1];
+    $("axe").value = r.axe; $("cote").value = r.cote_a;
+    $("ligne").max = r.axe === "x" ? r.largeur : r.hauteur;
+    $("ligne").value = r.ligne; $("lv").textContent = r.ligne;
+    $("cible").value = r.cible; $("plafond").value = r.plafond;
+    $("jpg").value = r.jeux_pour_gagner;
+  }
+
+  terrain(e);
+  journal(e);
+}
+
+/* Le terrain vu par la camera : le filet, et les derniers volants. */
+function terrain(e) {
+  const r = e.reglages, w = r.largeur, h = r.hauteur;
+  if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }
+  ctx.fillStyle = "#0b0d0f"; ctx.fillRect(0, 0, w, h);
+
+  ctx.strokeStyle = "#e67e22"; ctx.lineWidth = 2; ctx.beginPath();
+  if (r.axe === "x") { ctx.moveTo(r.ligne, 0); ctx.lineTo(r.ligne, h); }
+  else               { ctx.moveTo(0, r.ligne); ctx.lineTo(w, r.ligne); }
+  ctx.stroke();
+
+  const pts = e.journal.filter(v => v.x !== null && v.y !== null);
+  pts.forEach((v, i) => {
+    const frais = i === 0;
+    ctx.fillStyle = frais ? "#c0392b" : "rgba(41,128,185,.55)";
+    ctx.beginPath(); ctx.arc(v.x, v.y, frais ? 7 : 4, 0, 6.3); ctx.fill();
+  });
+}
+
+function journal(e) {
+  const t = $("journal").tBodies[0];
+  t.innerHTML = "<tr><th>heure</th><th>point</th><th>position</th></tr>"
+    + e.journal.map(v => {
+        const d = new Date(v.t * 1000).toLocaleTimeString("fr-FR");
+        const pos = v.x === null ? '<span class="manuel">manuel</span>'
+                                 : v.x + " , " + v.y;
+        return "<tr><td>" + d + "</td><td>" + e.reglages.noms[v.j] + "</td><td>" + pos + "</td></tr>";
+      }).join("");
+}
+
+$("p0").onclick = () => appel("/point?j=0").then(dessiner);
+$("p1").onclick = () => appel("/point?j=1").then(dessiner);
+$("annuler").onclick = () => appel("/annuler").then(dessiner);
+$("reset").onclick = () => {
+  if (confirm("Remettre le match a zero ?")) appel("/reset").then(dessiner);
+};
+
+function envoyerConfig() {
+  fige = Date.now() + 2000;
+  appel("/config", "POST", {
+    noms: [$("n0").value || "Joueur A", $("n1").value || "Joueur B"],
+    axe: $("axe").value, cote_a: $("cote").value,
+    ligne: +$("ligne").value, cible: +$("cible").value,
+    plafond: +$("plafond").value, jeux_pour_gagner: +$("jpg").value
+  }).then(dessiner);
+}
+["n0", "n1", "axe", "cote", "cible", "plafond", "jpg"].forEach(i => {
+  $(i).onchange = envoyerConfig;
+});
+$("ligne").oninput = () => { $("lv").textContent = $("ligne").value; fige = Date.now() + 2000;
+                             if (E) { E.reglages.ligne = +$("ligne").value; terrain(E); } };
+$("ligne").onchange = envoyerConfig;
+
+boucle();
+</script>
+</body>
+</html>
