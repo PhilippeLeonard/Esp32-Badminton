@@ -131,9 +131,10 @@ qu'il faut, et combien d'images par seconde la carte tient reellement :
 
 Seul l'enregistrement est concerne. Le capteur tourne en `PHOTO_SIZE` et
 ne descend en `REC_SIZE` que pendant un enregistrement, puis remonte :
-une carte lente degrade la video, jamais les photos. `PHOTO_SIZE` est
-aussi la taille maximale reservee en PSRAM, on ne peut pas basculer
-au-dessus en cours de route.
+une carte lente degrade la video, jamais les photos. Le changement de
+definition redemarre le pilote camera (~300 ms), le seul moyen en
+RGB565 : le pilote fige a l'initialisation le nombre d'octets attendus
+par image et refuse tout ce qui n'a pas cette taille.
 
 Si la carte prend du retard en cours de route, les images en retard sont
 **sautees** et comptees (`sautees` dans la page) au lieu de s'accumuler.
