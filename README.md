@@ -156,11 +156,20 @@ Le format `.rgb` n'a pas ce defaut :
 
 ### Relire les fichiers sur le PC
 
+Aucun lecteur ne connait le format `.rgb` : il faut le convertir, et
+l'outil le fait sans rien a installer.
+
 ```bash
 python tools/rgb_tool.py rec_0001.rgb                # ce qu'il contient
+python tools/rgb_tool.py rec_0001.rgb --avi video.avi # <-- lisible par VLC
 python tools/rgb_tool.py rec_0001.rgb --png 0 50 100 # quelques images
 python tools/rgb_tool.py rec_0001.rgb --mp4 out.mp4  # si ffmpeg est installe
 ```
+
+`--avi` ecrit un AVI non compresse (BI_RGB 24 bits) : pas de codec, VLC
+et Windows Media Player l'ouvrent directement. Il pese environ trois
+fois le `.rgb`. Ajouter `--flip` pour un enregistrement fait avant le
+correctif d'orientation.
 
 L'outil se fie a la taille du fichier, pas a l'entete, et ignore une
 derniere image incomplete : un enregistrement interrompu se relit sans

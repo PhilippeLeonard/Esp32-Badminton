@@ -2,8 +2,11 @@
 """Lit les enregistrements bruts /rec_NNNN.rgb de esp32_cam_simple.
 
     python tools/rgb_tool.py rec_0001.rgb                 # ce que contient le fichier
+    python tools/rgb_tool.py rec_0001.rgb --avi video.avi # lisible par VLC, sans rien installer
     python tools/rgb_tool.py rec_0001.rgb --png 0 50 100  # trois images en PNG
     python tools/rgb_tool.py rec_0001.rgb --mp4 sortie.mp4   # via ffmpeg s'il est la
+
+Ajouter --flip si l'image est a l'envers.
 
 Le nombre d'images vient de la TAILLE du fichier, pas de l'entete : un
 enregistrement coupe par une panne reste lisible, seule la derniere image
@@ -65,12 +68,74 @@ def write_png(path, w, h, rgb):
         o.write(png)
 
 
+def write_avi(out, src, n, w, h, fps, per, swap, flip):
+    """AVI non compresse (BI_RGB 24 bits). Aucun codec a installer : VLC,
+    Windows Media Player et ffmpeg le lisent tel quel. Les lignes d'un DIB
+    vont du bas vers le haut et les octets sont en BGR."""
+    row = w * 3
+    assert row % 4 == 0, "largeur non alignee, ajouter un bourrage"
+    frame_bytes = row * h
+    movi = n * (8 + frame_bytes)
+    idx = 16 * n
+
+    def tag(s, v):
+        return s + struct.pack('<I', v)
+
+    hdr = bytearray(224)
+    def put(off, data):
+        hdr[off:off + len(data)] = data
+    put(0, tag(b'RIFF', 216 + movi + 8 + idx)); put(8, b'AVI ')
+    put(12, tag(b'LIST', 192)); put(20, b'hdrl')
+    put(24, tag(b'avih', 56))
+    put(32, struct.pack('<I', 1000000 // (fps or 1)))
+    put(36, struct.pack('<I', frame_bytes * (fps or 1)))
+    put(44, struct.pack('<I', 0x10))            # AVIF_HASINDEX
+    put(48, struct.pack('<I', n))
+    put(56, struct.pack('<I', 1))
+    put(60, struct.pack('<I', frame_bytes))
+    put(64, struct.pack('<II', w, h))
+    put(88, tag(b'LIST', 116)); put(96, b'strl')
+    put(100, tag(b'strh', 56))
+    put(108, b'vids'); put(112, b'DIB ')
+    put(128, struct.pack('<I', 1))              # dwScale
+    put(132, struct.pack('<I', fps or 1))       # dwRate
+    put(140, struct.pack('<I', n))              # dwLength
+    put(144, struct.pack('<I', frame_bytes))
+    put(148, struct.pack('<I', 0xFFFFFFFF))
+    put(156, struct.pack('<HHHH', 0, 0, w, h))
+    put(164, tag(b'strf', 40))
+    put(172, struct.pack('<IiiHH', 40, w, h, 1, 24))
+    put(188, struct.pack('<II', 0, frame_bytes))  # BI_RGB, taille image
+    put(212, tag(b'LIST', 4 + movi)); put(220, b'movi')
+
+    o = open(out, 'wb')
+    o.write(bytes(hdr))
+    index = bytearray()
+    off = 4
+    for i in range(n):
+        src.seek(HEADER + i * per)
+        rgb = to_rgb888(src.read(per), swap)
+        rows = [rgb[y * row:(y + 1) * row] for y in range(h)]
+        if not flip:
+            rows.reverse()            # un DIB se lit de bas en haut
+        bgr = b''.join(bytes(r[k:k+3][::-1]) for r in rows for k in range(0, row, 3))
+        o.write(b'00db' + struct.pack('<I', frame_bytes))
+        o.write(bgr)
+        index += b'00db' + struct.pack('<III', 0x10, off, frame_bytes)
+        off += 8 + frame_bytes
+    o.write(b'idx1' + struct.pack('<I', idx))
+    o.write(bytes(index))
+    o.close()
+    print("  -> %s : %d images, %dx%d, %d i/s" % (out, n, w, h, fps))
+
+
 def main():
     args = sys.argv[1:]
     if not args:
         raise SystemExit(__doc__)
     path = args[0]
     swap = "--swap" in args
+    flip = "--flip" in args
     with open(path, "rb") as f:
         ver, w, h, fps, declared = read_header(f)
         n, rest, per = frame_count(path, w, h)
@@ -81,6 +146,9 @@ def main():
             print("  %d octets de queue : derniere image incomplete, ignoree" % rest)
         if declared and declared != n:
             print("  l'entete et la taille ne sont pas d'accord : c'est la taille qui fait foi")
+
+        if "--avi" in args:
+            write_avi(args[args.index("--avi") + 1], f, n, w, h, fps or 10, per, swap, flip)
 
         if "--png" in args:
             want = []
@@ -96,7 +164,10 @@ def main():
                     continue
                 f.seek(HEADER + i * per)
                 p = os.path.join(outdir, "f%05d.png" % i)
-                write_png(p, w, h, to_rgb888(f.read(per), swap))
+                rgb = to_rgb888(f.read(per), swap)
+                if flip:
+                    rgb = b"".join(rgb[y * w * 3:(y + 1) * w * 3] for y in range(h - 1, -1, -1))
+                write_png(p, w, h, rgb)
                 print("  ->", p)
 
         if "--mp4" in args:

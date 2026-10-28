@@ -174,8 +174,12 @@ static bool initCamera() {
   }
   sensor_t* s = esp_camera_sensor_get();
   if (s) {
-    s->set_vflip(s, 0);       // 1 si l'image est a l'envers
-    s->set_hmirror(s, 0);
+    /* Le capteur sort l'image tournee de 180 degres sur cette carte :
+     * verifiee a l'envers sur un enregistrement, et un texte filme par
+     * l'ancienne version sortait en miroir. Les deux lignes a toucher si
+     * l'orientation est encore fausse. */
+    s->set_vflip(s, 1);
+    s->set_hmirror(s, 1);
     s->set_whitebal(s, 1);    // la balance des blancs reste automatique :
     s->set_awb_gain(s, 1);    // sans elle le gymnase tire au vert
   }
