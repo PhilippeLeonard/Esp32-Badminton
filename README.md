@@ -90,9 +90,21 @@ La page a deux boutons :
   clic (converti juste pour le navigateur). Rien n'est diffuse en continu.
   La photo est en `PHOTO_SIZE` (640x480 par defaut) : elle ne passe pas
   par la carte SD, donc rien ne l'oblige a etre minuscule.
-- **Demarrer / arreter l'enregistrement** -> `GET /record?on=1|0`, ecrit
-  `/rec_NNNN.rgb` sur la carte SD : **couleur, aucune compression**, les
-  octets RGB565 sortis du capteur tels quels.
+- **Demarrer / arreter l'enregistrement** -> `GET /record?on=1|0&fmt=jpg|rgb`,
+  avec deux formats au choix (case a cocher sur la page) :
+
+  | format | fichier | 5 s en QVGA | pour quoi |
+  | --- | --- | --- | --- |
+  | `jpg` (defaut) | `/rec_NNNN.mjpg` | ~300 ko | regarder, expedier |
+  | `rgb` | `/rec_NNNN.rgb` | 3,75 Mo | rejouer un algorithme |
+
+  Le brut garde les octets RGB565 du capteur tels quels : indispensable
+  si les seuils doivent voir exactement les memes pixels qu'en direct.
+  Le JPEG est converti en logiciel juste avant l'ecriture, le capteur ne
+  change pas, et il divise la taille par douze.
+
+  Le format se choisit au demarrage et nulle part ailleurs : en changer
+  en cours d'enregistrement melangerait deux formats dans un fichier.
 
 ### Debit : c'est la carte SD qui decide
 
@@ -146,11 +158,13 @@ donc une carte debranchee en pleine ecriture laissait un fichier
 illisible, voire entierement a zero quand meme l'entete n'avait pas ete
 vidangee.
 
-Le format `.rgb` n'a pas ce defaut :
+Les deux formats de la version simple n'ont pas ce defaut :
 
 - l'entete de 32 octets est complete et **vidangee des le depart** ;
-- toutes les images font la meme taille, donc leur nombre se deduit de la
-  taille du fichier - rien a corriger a la fermeture ;
+- en `.rgb` toutes les images font la meme taille, donc leur nombre se
+  deduit de la taille du fichier ; en `.mjpg` chaque image est precedee
+  de sa longueur, ce qui permet de s'arreter net sur une image coupee -
+  dans les deux cas rien a corriger a la fermeture ;
 - vidange une fois par seconde, donc une coupure coute au pire une
   seconde d'images et jamais le fichier.
 
@@ -160,6 +174,7 @@ Aucun lecteur ne connait le format `.rgb` : il faut le convertir, et
 l'outil le fait sans rien a installer.
 
 ```bash
+python tools/rgb_tool.py rec_0001.mjpg --avi video.avi # un .mjpg
 python tools/rgb_tool.py rec_0001.rgb                # ce qu'il contient
 python tools/rgb_tool.py rec_0001.rgb --avi video.avi # <-- lisible par VLC
 python tools/rgb_tool.py rec_0001.rgb --png 0 50 100 # quelques images
