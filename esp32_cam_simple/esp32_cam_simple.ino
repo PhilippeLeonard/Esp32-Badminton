@@ -530,7 +530,10 @@ static void handleDownload() {
 }
 
 /* Relance la station apres l'abandon : le telephone est sur l'AP, il
- * vient d'allumer son hotspot, et rien ne doit obliger a redemarrer. */
+ * vient d'allumer son hotspot, et rien ne doit obliger a redemarrer.
+ * Ici on tente meme avec un client sur l'AP, contrairement a loop() :
+ * c'est une demande explicite, et le telephone sera peut-etre ejecte le
+ * temps que l'AP suive le canal du hotspot. */
 static void handleWifi() {
   staTries = 0;
   WiFi.begin(WIFI_SSID, WIFI_PASS);
@@ -719,6 +722,13 @@ void loop() {
   static bool     wasUp = false;
   if (millis() - lastTry > STA_RETRY_MS) {
     lastTry = millis();
+#if AP_ENABLED
+    /* L'AP et la station partagent la radio : des que la station
+       s'associe, l'AP est tire sur le canal du hotspot et le telephone
+       deja connecte a ESP32-CAM est ejecte (note de esp32_cam_recorder).
+       Tant que quelqu'un est sur l'AP, on ne tente donc rien. */
+    if (WiFi.softAPgetStationNum() > 0) return;
+#endif
     const wl_status_t st = WiFi.status();
     if (st == WL_CONNECTED) {
       staTries = 0;
