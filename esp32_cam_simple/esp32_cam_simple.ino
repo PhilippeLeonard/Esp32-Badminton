@@ -3,36 +3,54 @@
  * La carte rejoint le hotspot du telephone et sert une page a deux
  * boutons :
  *   - une image : /shot renvoie un JPEG pris a l'instant
- *   - un enregistrement : /record?on=1 ecrit un .avi MJPEG sur la carte SD
+ *   - un enregistrement : /record?on=1 ecrit /rec_NNNN.rgb sur la carte SD,
+ *     en couleur et sans aucune compression (RGB565, les octets sortis du
+ *     capteur tels quels)
  *
  * L'enregistrement s'arrete tout seul quand il ne reste plus assez de
  * place sur la carte, ou quand la duree maximale est atteinte.
+ *
+ * Le fichier est lisible meme si la carte perd le courant en pleine
+ * ecriture : l'entete est complete et vidangee des la premiere image, et
+ * le nombre d'images se deduit de la taille du fichier. Seule la derniere
+ * image en cours d'ecriture est perdue. C'est ce qui manquait a la
+ * version .avi : son index et sa taille n'etaient ecrits qu'a la
+ * fermeture, donc une coupure laissait un fichier illisible.
  *
  * IDE : carte "ESP32 Wrover Module", PSRAM Enabled,
  *       Partition Scheme "Huge APP (3MB No OTA)".
  */
 
 #include "esp_camera.h"
+#include "img_converters.h"
 #include <WiFi.h>
 #include <WebServer.h>
 #include <ESPmDNS.h>
 #include "FS.h"
 #include "SD_MMC.h"
 
-#define FW_VERSION "2.0.0-simple"
+#define FW_VERSION "2.1.0-raw"
 
 /* ------------------------- reglages ---------------------------------- */
 static const char* WIFI_SSID = "Philphone";   // hotspot 2.4 GHz du telephone
 static const char* WIFI_PASS = "12345678";
 static const char* HOSTNAME  = "esp32cam";    // http://esp32cam.local
 
-#define FRAME_SIZE       FRAMESIZE_VGA   // 640x480
-#define JPEG_QUALITY     12              // 10 = mieux et plus gros, 20 = plus petit
+/* Debit de l'enregistrement = largeur * hauteur * 2 * REC_FPS.
+ * La carte SD ne tourne qu'en 1 bit (voir SD_ONE_BIT_MODE plus bas), ce
+ * qui plafonne vers 1 Mo/s en ecriture soutenue. QVGA a 5 i/s fait
+ * 768 ko/s : c'est exactement le debit que l'ancienne version tenait deja
+ * en gris. Monter a 10 i/s demanderait 1,5 Mo/s et ferait decrocher.
+ *   QVGA  320x240 @ 5  -> 768 ko/s   (defaut)
+ *   QQVGA 160x120 @ 20 -> 768 ko/s   (plus fluide, moins defini)        */
+#define FRAME_SIZE       FRAMESIZE_QVGA  // 320x240
+#define REC_FPS          5
+#define PREVIEW_QUALITY  10              // qualite du JPEG de /shot seulement
 #define XCLK_FREQ_HZ     10000000
 
-#define REC_FPS          10
-#define REC_MAX_FRAMES   18000           // 30 min a 10 i/s (index = 16 o/image)
+#define REC_MAX_MINUTES  30              // garde-fou de duree
 #define SD_MIN_FREE_MB   20              // marge sous laquelle on coupe
+#define SD_BENCH         1               // mesure le debit de la carte au demarrage
 
 /* ----------------------- brochage Freenove --------------------------- */
 #define PWDN_GPIO_NUM    -1
@@ -52,6 +70,9 @@ static const char* HOSTNAME  = "esp32cam";    // http://esp32cam.local
 #define HREF_GPIO_NUM    23
 #define PCLK_GPIO_NUM    22
 
+/* GPIO 4 porte Y2 de la camera, et c'est aussi DATA1 du bus SD. Le mode
+ * 4 bits est donc impossible sur cette carte : on reste en 1 bit, d'ou le
+ * plafond de debit ci-dessus. */
 #define SD_ONE_BIT_MODE  true
 #define SD_MOUNT_POINT   "/sdcard"
 
@@ -59,74 +80,41 @@ WebServer server(80);
 
 static bool     sdReady   = false;
 static String   lastMsg   = "";
+static float    sdMbPerSec = 0.0f;      // mesure au demarrage, 0 = non mesure
+
+/* ------------------------ enregistrement ------------------------------ *
+ * Format du fichier, petit-boutiste, entete de 32 octets puis les images
+ * a la suite, chacune de width*height*2 octets en RGB565 :
+ *    0  "ESPC"    4 o   magie
+ *    4  version   u16   1
+ *    6  format    u16   0 = RGB565 petit-boutiste
+ *    8  width     u16
+ *   10  height    u16
+ *   12  fps       u16
+ *   14  (reserve) u16
+ *   16  frames    u32   0 tant que l'enregistrement tourne, renseigne a
+ *                       l'arret ; un lecteur doit de toute facon se fier
+ *                       a la taille du fichier, cette valeur n'est qu'une
+ *                       indication
+ *   20  (reserve) 12 o
+ * tools/rgb_tool.py lit exactement ca.                                   */
+static const uint32_t REC_HEADER_BYTES = 32;
 
 static File     recFile;
-static bool     recOn     = false;
-static uint32_t recFrames = 0;
-static uint32_t recNextMs = 0;
-static uint32_t recMovi   = 0;        // octets de donnees deja ecrits
-static uint32_t recMax    = 0;        // plus grande image du fichier
+static bool     recOn       = false;
+static uint32_t recFrames   = 0;
+static uint32_t recDropped  = 0;
+static uint32_t recNextMs   = 0;
+static uint32_t recStartMs  = 0;
+static uint32_t recFrameLen = 0;        // octets par image
 static uint16_t recW = 0, recH = 0;
-static uint8_t* recIdx    = nullptr;  // index idx1, en PSRAM
-static uint64_t recFree   = 0;        // place restante estimee, en octets
+static uint64_t recFree     = 0;        // place restante estimee, en octets
 static char     recPath[32] = {0};
-
-/* --------------------------- AVI MJPEG -------------------------------- *
- * Les images sortent deja compressees du capteur, elles entrent dans le
- * fichier telles quelles. L'entete fait 224 octets, ecrits une premiere
- * fois a zero puis corriges a la fermeture.                              */
-static const uint32_t AVI_HEADER_BYTES = 224;
 
 static inline void w32(uint8_t* p, uint32_t v) {
   p[0] = v; p[1] = v >> 8; p[2] = v >> 16; p[3] = v >> 24;
 }
 static inline void w16(uint8_t* p, uint16_t v) { p[0] = v; p[1] = v >> 8; }
-static inline void tag(uint8_t* p, const char* s) { memcpy(p, s, 4); }
-
-static void buildAviHeader(uint8_t* h, uint16_t w, uint16_t ht,
-                           uint32_t fps, uint32_t frames,
-                           uint32_t movi, uint32_t maxFrame) {
-  memset(h, 0, AVI_HEADER_BYTES);
-  if (fps == 0) fps = 1;
-  const uint32_t usPerFrame = 1000000UL / fps;
-  const uint32_t idxBytes   = 16UL * frames;
-
-  tag(h + 0,  "RIFF"); w32(h + 4,  216 + movi + 8 + idxBytes); tag(h + 8, "AVI ");
-  tag(h + 12, "LIST"); w32(h + 16, 192);                       tag(h + 20, "hdrl");
-
-  tag(h + 24, "avih"); w32(h + 28, 56);
-  w32(h + 32, usPerFrame);
-  w32(h + 36, maxFrame * fps);
-  w32(h + 44, 0x10);                // AVIF_HASINDEX
-  w32(h + 48, frames);
-  w32(h + 56, 1);
-  w32(h + 60, maxFrame);
-  w32(h + 64, w);
-  w32(h + 68, ht);
-
-  tag(h + 88,  "LIST"); w32(h + 92, 116); tag(h + 96, "strl");
-
-  tag(h + 100, "strh"); w32(h + 104, 56);
-  tag(h + 108, "vids");
-  tag(h + 112, "MJPG");
-  w32(h + 128, 1);
-  w32(h + 132, fps);
-  w32(h + 140, frames);
-  w32(h + 144, maxFrame);
-  w32(h + 148, 0xFFFFFFFF);
-  w16(h + 156, 0); w16(h + 158, 0); w16(h + 160, w); w16(h + 162, ht);
-
-  tag(h + 164, "strf"); w32(h + 168, 40);
-  w32(h + 172, 40);
-  w32(h + 176, w);
-  w32(h + 180, ht);
-  w16(h + 184, 1);
-  w16(h + 186, 24);
-  tag(h + 188, "MJPG");
-  w32(h + 192, (uint32_t)w * ht * 3);
-
-  tag(h + 212, "LIST"); w32(h + 216, 4 + movi); tag(h + 220, "movi");
-}
 
 /* --------------------------- camera ---------------------------------- */
 static bool initCamera() {
@@ -142,9 +130,9 @@ static bool initCamera() {
   c.pin_sccb_sda = SIOD_GPIO_NUM; c.pin_sccb_scl = SIOC_GPIO_NUM;
   c.pin_pwdn  = PWDN_GPIO_NUM;  c.pin_reset = RESET_GPIO_NUM;
   c.xclk_freq_hz = XCLK_FREQ_HZ;
-  c.pixel_format = PIXFORMAT_JPEG;        // compression par le capteur
+  c.pixel_format = PIXFORMAT_RGB565;      // couleur, aucune compression
   c.frame_size   = FRAME_SIZE;
-  c.jpeg_quality = JPEG_QUALITY;
+  c.jpeg_quality = PREVIEW_QUALITY;
   c.grab_mode    = CAMERA_GRAB_LATEST;
   c.fb_location  = psramFound() ? CAMERA_FB_IN_PSRAM : CAMERA_FB_IN_DRAM;
   c.fb_count     = psramFound() ? 2 : 1;
@@ -158,6 +146,8 @@ static bool initCamera() {
   if (s) {
     s->set_vflip(s, 0);       // 1 si l'image est a l'envers
     s->set_hmirror(s, 0);
+    s->set_whitebal(s, 1);    // la balance des blancs reste automatique :
+    s->set_awb_gain(s, 1);    // sans elle le gymnase tire au vert
   }
   return true;
 }
@@ -185,7 +175,28 @@ static uint64_t sdFreeBytes() {
   return (total > used) ? (total - used) : 0;
 }
 
-/* ------------------------ enregistrement ------------------------------ */
+/* Quatre mega-octets ecrits puis effaces : une carte lente se voit tout
+ * de suite au demarrage, au lieu de donner un enregistrement qui saute. */
+static void benchSD() {
+  if (!sdReady) return;
+  static uint8_t blk[8192];
+  memset(blk, 0xA5, sizeof(blk));
+  File f = SD_MMC.open("/bench.tmp", FILE_WRITE);
+  if (!f) return;
+  const uint32_t t0 = millis();
+  const int blocks = 512;                       // 4 Mo
+  for (int i = 0; i < blocks; i++) {
+    if (f.write(blk, sizeof(blk)) != sizeof(blk)) break;
+  }
+  f.flush();
+  const uint32_t ms = millis() - t0;
+  f.close();
+  SD_MMC.remove("/bench.tmp");
+  if (ms) sdMbPerSec = (blocks * sizeof(blk) / 1048576.0f) * 1000.0f / ms;
+  Serial.printf("[SD] ecriture mesuree: %.2f Mo/s\n", sdMbPerSec);
+}
+
+/* ------------------------ enregistrement ----------------------------- */
 static void stopRecording(const char* why);
 
 static bool startRecording() {
@@ -200,102 +211,119 @@ static bool startRecording() {
   camera_fb_t* fb = esp_camera_fb_get();
   if (!fb) { lastMsg = "capture impossible"; return false; }
   recW = fb->width; recH = fb->height;
+  recFrameLen = (uint32_t)recW * recH * 2;
   esp_camera_fb_return(fb);
 
-  recIdx = (uint8_t*)ps_malloc(16UL * REC_MAX_FRAMES);
-  if (!recIdx) { lastMsg = "PSRAM insuffisante"; return false; }
-
   for (uint16_t i = 1; i < 10000; i++) {
-    snprintf(recPath, sizeof(recPath), "/rec_%04u.avi", i);
+    snprintf(recPath, sizeof(recPath), "/rec_%04u.rgb", i);
     if (!SD_MMC.exists(recPath)) break;
   }
   recFile = SD_MMC.open(recPath, FILE_WRITE);
-  if (!recFile) {
-    free(recIdx); recIdx = nullptr;
-    lastMsg = String("creation impossible: ") + recPath;
+  if (!recFile) { lastMsg = String("creation impossible: ") + recPath; return false; }
+
+  uint8_t h[REC_HEADER_BYTES];
+  memset(h, 0, sizeof(h));
+  memcpy(h, "ESPC", 4);
+  w16(h + 4, 1);                 // version
+  w16(h + 6, 0);                 // RGB565
+  w16(h + 8, recW);
+  w16(h + 10, recH);
+  w16(h + 12, REC_FPS);
+  w32(h + 16, 0);                // renseigne a l'arret, jamais indispensable
+  if (recFile.write(h, REC_HEADER_BYTES) != REC_HEADER_BYTES) {
+    recFile.close();
+    lastMsg = "ecriture de l'entete impossible";
     return false;
   }
+  /* Vidange immediate : c'est l'omission de ce flush qui laissait des
+   * fichiers entierement a zero quand la carte perdait le courant. */
+  recFile.flush();
 
-  uint8_t hdr[AVI_HEADER_BYTES];
-  buildAviHeader(hdr, recW, recH, REC_FPS, 0, 0, 0);
-  recFile.write(hdr, AVI_HEADER_BYTES);
-
-  recFrames = 0;
-  recMovi   = 0;
-  recMax    = 0;
-  recFree   = sdFreeBytes();
-  recNextMs = millis();
-  recOn     = true;
-  lastMsg   = "";
-  Serial.printf("[REC] %s  %ux%u @ %d i/s\n", recPath, recW, recH, REC_FPS);
+  recFrames  = 0;
+  recDropped = 0;
+  recFree    = sdFreeBytes();
+  recStartMs = millis();
+  recNextMs  = recStartMs;
+  recOn      = true;
+  lastMsg    = "";
+  Serial.printf("[REC] %s  %ux%u RGB565 @ %d i/s  (%.2f Mo/s)\n",
+                recPath, recW, recH, REC_FPS,
+                recFrameLen * (float)REC_FPS / 1048576.0f);
   return true;
 }
 
 static void stopRecording(const char* why) {
   if (!recOn) return;
   recOn = false;
-
-  uint8_t ih[8];
-  tag(ih, "idx1"); w32(ih + 4, 16UL * recFrames);
-  recFile.write(ih, 8);
-  recFile.write(recIdx, 16UL * recFrames);
+  recFile.flush();
   recFile.close();
 
+  /* Confort uniquement : le fichier se lit deja sans ce chiffre. */
   File patch = SD_MMC.open(recPath, "r+");
   if (patch) {
-    uint8_t hdr[AVI_HEADER_BYTES];
-    buildAviHeader(hdr, recW, recH, REC_FPS, recFrames, recMovi, recMax);
-    patch.seek(0);
-    patch.write(hdr, AVI_HEADER_BYTES);
+    uint8_t n[4];
+    w32(n, recFrames);
+    patch.seek(16);
+    patch.write(n, 4);
     patch.close();
   }
-  free(recIdx); recIdx = nullptr;
 
+  const float secs = (millis() - recStartMs) / 1000.0f;
   lastMsg = String(why ? why : "arrete") + " - " + String(recFrames) + " images";
-  Serial.printf("[REC] %s: %u images, %.1f Mo (%s)\n", recPath, (unsigned)recFrames,
-                recMovi / 1048576.0, why ? why : "arrete");
+  if (recDropped) lastMsg += ", " + String(recDropped) + " sautees";
+  Serial.printf("[REC] %s: %u images en %.1f s, %.1f Mo, %u sautees (%s)\n",
+                recPath, (unsigned)recFrames, secs,
+                (double)recFrames * recFrameLen / 1048576.0,
+                (unsigned)recDropped, why ? why : "arrete");
 }
 
 /* Appelee en boucle : une image par periode, et on coupe avant que la
- * carte soit reellement pleine - un .avi tronque en pleine ecriture n'a
- * ni index ni entete correcte, donc ne se lit plus. */
+ * carte soit reellement pleine. */
 static void recordTick() {
   if (!recOn) return;
   const uint32_t now = millis();
   if ((int32_t)(now - recNextMs) < 0) return;
-  recNextMs = now + 1000UL / REC_FPS;
 
-  if (recFrames >= REC_MAX_FRAMES) { stopRecording("duree maximale atteinte"); return; }
+  const uint32_t period = 1000UL / REC_FPS;
+  /* Si la carte a pris du retard, on saute la ou les images en retard au
+   * lieu d'accumuler : mieux vaut un trou franc qu'une boucle qui ne
+   * rattrape jamais et finit par ne plus rendre la main au serveur. */
+  if ((int32_t)(now - recNextMs) > (int32_t)period) {
+    recDropped += (now - recNextMs) / period;
+    recNextMs = now;
+  }
+  recNextMs += period;
+
+  if (now - recStartMs > (uint32_t)REC_MAX_MINUTES * 60000UL) {
+    stopRecording("duree maximale atteinte");
+    return;
+  }
 
   camera_fb_t* fb = esp_camera_fb_get();
-  if (!fb) return;
-  const uint32_t len = fb->len;
-  const uint32_t pad = (len & 1) ? 1 : 0;
-  const uint64_t need = 8 + len + pad + 16;          // chunk + entree d'index
+  if (!fb) { recDropped++; return; }
+  if (fb->len != recFrameLen) {          // taille inattendue : on n'ecrit pas
+    esp_camera_fb_return(fb);
+    stopRecording("taille d'image inattendue");
+    return;
+  }
 
   /* La place est suivie par soustraction : interroger la FAT a chaque
    * image bloquerait l'ecriture. Il reste la marge SD_MIN_FREE_MB. */
-  if (recFree < need + (uint64_t)SD_MIN_FREE_MB * 1024ULL * 1024ULL) {
+  if (recFree < (uint64_t)recFrameLen + (uint64_t)SD_MIN_FREE_MB * 1024ULL * 1024ULL) {
     esp_camera_fb_return(fb);
     stopRecording("carte SD presque pleine");
     return;
   }
 
-  uint8_t ch[8];
-  tag(ch, "00dc"); w32(ch + 4, len);
-  const bool ok = recFile.write(ch, 8) == 8 && recFile.write(fb->buf, len) == len;
+  const bool ok = recFile.write(fb->buf, recFrameLen) == recFrameLen;
   esp_camera_fb_return(fb);
   if (!ok) { stopRecording("ecriture SD en echec"); return; }
-  if (pad) { const uint8_t z = 0; recFile.write(&z, 1); }
 
-  uint8_t* e = recIdx + 16UL * recFrames;
-  tag(e, "00dc"); w32(e + 4, 0x10); w32(e + 8, 4 + recMovi); w32(e + 12, len);
-
-  recMovi += 8 + len + pad;
-  recFree -= need;
-  if (len > recMax) recMax = len;
   recFrames++;
-  if ((recFrames & 0x1F) == 0) recFile.flush();
+  recFree -= recFrameLen;
+  /* Une vidange par seconde : la FAT suit la taille reelle, donc une
+   * coupure ne coute qu'une seconde d'images, jamais le fichier. */
+  if (recFrames % REC_FPS == 0) recFile.flush();
 }
 
 /* ----------------------------- page ---------------------------------- */
@@ -329,8 +357,9 @@ function st(){
     g('rb').textContent=on?"Arreter l'enregistrement":"Demarrer l'enregistrement";
     g('rb').className=on?'rec':'';
     g('st').textContent=
-      (s.sd?'carte SD ok, '+s.freemb+' Mo libres':'pas de carte SD')+
-      (on?'\nenregistre '+s.file+' : '+s.frames+' images, '+s.mb+' Mo':'')+
+      (s.sd?'carte SD ok, '+s.freemb+' Mo libres'+(s.cardmbs?', '+s.cardmbs+' Mo/s':''):'pas de carte SD')+
+      '\n'+s.w+'x'+s.h+' couleur brute, '+s.fps+' i/s = '+s.needmbs+' Mo/s'+
+      (on?'\nenregistre '+s.file+' : '+s.frames+' images, '+s.mb+' Mo, '+s.dropped+' sautees':'')+
       (s.msg?'\n'+s.msg:'');
     files();
   }).catch(()=>{g('st').textContent='carte injoignable';});
@@ -351,16 +380,24 @@ static void cors() { server.sendHeader("Access-Control-Allow-Origin", "*"); }
 
 static void handleRoot() { server.send_P(200, "text/html", PAGE); }
 
-/* Une seule image, prise au moment du clic. Rien n'est diffuse en continu. */
+/* Une seule image, prise au moment du clic, convertie en JPEG pour le
+ * telephone : le brut RGB565 ne s'affiche pas dans un navigateur. Rien
+ * n'est diffuse en continu. */
 static void handleShot() {
   camera_fb_t* fb = esp_camera_fb_get();
   if (!fb) { server.send(503, "text/plain", "capture impossible"); return; }
+  uint8_t* jpg = nullptr;
+  size_t   len = 0;
+  const bool ok = fmt2jpg(fb->buf, fb->len, fb->width, fb->height,
+                          PIXFORMAT_RGB565, PREVIEW_QUALITY, &jpg, &len);
+  esp_camera_fb_return(fb);
+  if (!ok) { server.send(503, "text/plain", "conversion impossible"); return; }
   cors();
   server.sendHeader("Cache-Control", "no-store");
-  server.setContentLength(fb->len);
+  server.setContentLength(len);
   server.send(200, "image/jpeg", "");
-  server.sendContent((const char*)fb->buf, fb->len);
-  esp_camera_fb_return(fb);
+  server.sendContent((const char*)jpg, len);
+  free(jpg);
 }
 
 static void handleRecordRoute() {
@@ -375,13 +412,19 @@ static void handleRecordRoute() {
 
 static void handleStatus() {
   const uint64_t freeMb = (recOn ? recFree : sdFreeBytes()) / (1024ULL * 1024ULL);
-  char j[256];
+  const uint32_t flen   = recFrameLen ? recFrameLen : (uint32_t)320 * 240 * 2;
+  char j[384];
   snprintf(j, sizeof(j),
            "{\"ver\":\"" FW_VERSION "\",\"sd\":%s,\"rec\":%s,\"frames\":%u,"
-           "\"mb\":%.1f,\"freemb\":%u,\"file\":\"%s\",\"msg\":\"%s\"}",
+           "\"mb\":%.1f,\"freemb\":%u,\"dropped\":%u,\"file\":\"%s\","
+           "\"w\":%u,\"h\":%u,\"fps\":%u,\"needmbs\":\"%.2f\",\"cardmbs\":\"%.2f\","
+           "\"msg\":\"%s\"}",
            sdReady ? "true" : "false", recOn ? "true" : "false",
-           (unsigned)recFrames, recMovi / 1048576.0, (unsigned)freeMb,
-           recOn ? recPath : "", lastMsg.c_str());
+           (unsigned)recFrames, (double)recFrames * flen / 1048576.0,
+           (unsigned)freeMb, (unsigned)recDropped, recOn ? recPath : "",
+           (unsigned)(recW ? recW : 320), (unsigned)(recH ? recH : 240),
+           (unsigned)REC_FPS, flen * (double)REC_FPS / 1048576.0,
+           (double)sdMbPerSec, lastMsg.c_str());
   cors();
   server.send(200, "application/json", j);
 }
@@ -398,7 +441,7 @@ static void handleFiles() {
     while (f) {
       String n = f.name();
       if (n.startsWith("/")) n = n.substring(1);
-      if (n.endsWith(".avi")) {
+      if (n.endsWith(".rgb")) {
         char row[96];
         snprintf(row, sizeof(row), "%s{\"n\":\"%s\",\"s\":%u}",
                  first ? "" : ",", n.c_str(), (unsigned)f.size());
@@ -445,6 +488,8 @@ static void handleDownload() {
     delay(0);
   }
   file.close();
+  Serial.printf("[HTTP] %s: %u/%u octets%s\n", f.c_str(), (unsigned)sent,
+                (unsigned)total, sent == total ? "" : "  <-- TRONQUE");
 }
 
 static void handleDelete() {
@@ -474,6 +519,22 @@ void setup() {
   if (!psramFound()) Serial.println("[BOOT] attention: pas de PSRAM");
   if (!initCamera()) { Serial.println("[BOOT] camera absente - arret"); while (true) delay(1000); }
   sdReady = initSD();
+
+#if SD_BENCH
+  benchSD();
+  {
+    /* Une capture suffit a connaitre la taille d'une image, donc le debit
+     * exige : si la carte est en dessous, autant le savoir avant le match. */
+    camera_fb_t* fb = esp_camera_fb_get();
+    if (fb) {
+      const float need = (float)fb->len * REC_FPS / 1048576.0f;
+      esp_camera_fb_return(fb);
+      Serial.printf("[SD] l'enregistrement demande %.2f Mo/s%s\n", need,
+                    (sdMbPerSec > 0.0f && sdMbPerSec < need * 1.2f)
+                      ? "  <-- carte trop lente, baisser REC_FPS" : "");
+    }
+  }
+#endif
 
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
