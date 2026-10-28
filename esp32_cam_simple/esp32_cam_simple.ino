@@ -476,7 +476,7 @@ static const char PAGE[] PROGMEM = R"HTML(<!doctype html>
 <h2>ESP32 CAM</h2>
 <button onclick="shot()">Prendre une image</button>
 <button id="rb" onclick="rec()">Demarrer l'enregistrement</button>
-<label id="fl"><input type="checkbox" id="jp" checked> JPEG (12x plus leger)</label>
+<label><input type="checkbox" id="jp" checked> JPEG (12x plus leger)</label>
 <img id="im" alt="">
 <div id="st">...</div>
 <p><a href="#" onclick="fetch('/wifi').then(st);return false">reessayer le hotspot</a></p>
@@ -499,7 +499,8 @@ function st(){
     g('jp').checked=s.jpeg; g('jp').disabled=on;
     g('st').textContent=
       (s.sd?'carte SD ok, '+s.freemb+' Mo libres'+(s.cardmbs?', '+s.cardmbs+' Mo/s':''):'pas de carte SD')+
-      '\nenregistrement '+s.w+'x'+s.h+' couleur brute, '+s.fps+' i/s = '+s.needmbs+' Mo/s'+
+      '\nenregistrement '+s.w+'x'+s.h+(s.jpeg?' JPEG':' couleur brute')+', '+s.fps+' i/s'+
+      (s.jpeg?'':' = '+s.needmbs+' Mo/s')+
       (s.ap?'\npoint d\'acces '+s.ap:'')+
       (s.ip?'  /  hotspot '+s.ip:'  /  hotspot non rejoint')+
       (on?'\nenregistre '+s.file+' : '+s.frames+' images, '+s.mb+' Mo, '+s.dropped+' sautees':'')+
