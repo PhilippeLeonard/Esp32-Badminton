@@ -524,14 +524,91 @@ static void announceMdns() {
   }
 }
 
+/* Pourquoi l'association a echoue : le code du pilote, en clair. */
+static const char* wifiStatusName(int st) {
+  switch (st) {
+    case WL_NO_SSID_AVAIL:  return "reseau introuvable (eteint, 5 GHz, ou SSID masque)";
+    case WL_CONNECT_FAILED: return "refus (mot de passe, ou WPA3 seul)";
+    case WL_CONNECTION_LOST: return "lien perdu";
+    case WL_DISCONNECTED:   return "deconnecte";
+    case WL_IDLE_STATUS:    return "toujours en cours";
+    default:                return "inconnu";
+  }
+}
+
+/* Ce que la carte voit vraiment autour d'elle. Affiche seulement quand
+ * l'association a echoue : un hotspot absent de cette liste est en
+ * 5 GHz, masque ou eteint, et aucun reglage du croquis n'y changera
+ * rien. S'il y figure en WPA3 seul, l'ESP32 ne sait pas s'y associer. */
+static void scanAndReport() {
+  Serial.println("[WIFI] reseaux 2,4 GHz visibles :");
+  const int n = WiFi.scanNetworks();
+  if (n <= 0) { Serial.println("  aucun"); return; }
+  for (int i = 0; i < n; i++) {
+    const char* enc = "?";
+    switch (WiFi.encryptionType(i)) {
+      case WIFI_AUTH_OPEN:            enc = "ouvert"; break;
+      case WIFI_AUTH_WEP:             enc = "WEP"; break;
+      case WIFI_AUTH_WPA_PSK:         enc = "WPA"; break;
+      case WIFI_AUTH_WPA2_PSK:        enc = "WPA2"; break;
+      case WIFI_AUTH_WPA_WPA2_PSK:    enc = "WPA/WPA2"; break;
+      case WIFI_AUTH_WPA3_PSK:        enc = "WPA3 (non supporte)"; break;
+      case WIFI_AUTH_WPA2_WPA3_PSK:   enc = "WPA2/WPA3"; break;
+      default: break;
+    }
+    Serial.printf("  %-24s  canal %2d  %4d dBm  %s%s\n",
+                  WiFi.SSID(i).c_str(), WiFi.channel(i), WiFi.RSSI(i), enc,
+                  WiFi.SSID(i) == WIFI_SSID ? "   <-- le votre" : "");
+  }
+  WiFi.scanDelete();
+}
+
+static void connectWifi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.setHostname(HOSTNAME);
+  /* Pas de setAutoReconnect : le pilote relancerait ses propres tentatives
+   * en parallele de celles de loop(), et chaque begin() tomberait alors
+   * sur "sta is connecting, return error". */
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.printf("[WIFI] %s", WIFI_SSID);
+  const uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) { delay(400); Serial.print('.'); }
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("[WIFI] http://"); Serial.println(WiFi.localIP());
+    Serial.printf("[WIFI] canal %d, %d dBm\n", WiFi.channel(), WiFi.RSSI());
+    announceMdns();
+    return;
+  }
+
+  const int st = WiFi.status();
+  /* Le pilote continue d'essayer apres notre delai : sans cet arret, la
+   * tentative suivante se superpose et il repond "sta is connecting,
+   * return error". Meme correctif que dans esp32_cam_recorder. */
+  WiFi.disconnect(false);
+  Serial.printf("[WIFI] echec: %s (code %d)\n", wifiStatusName(st), st);
+  scanAndReport();
+  Serial.printf("[WIFI] nouvelle tentative toutes les %u s\n",
+                (unsigned)(STA_RETRY_MS / 1000));
+}
+
 void setup() {
   Serial.begin(115200);
   delay(300);
   Serial.println("\n[BOOT] ESP32 CAM simple " FW_VERSION);
 
   if (!psramFound()) Serial.println("[BOOT] attention: pas de PSRAM");
-  if (!initCamera()) { Serial.println("[BOOT] camera absente - arret"); while (true) delay(1000); }
   sdReady = initSD();
+
+  /* Le wifi passe AVANT la camera : s'associer fait scanner la radio, et
+   * ce scan monopolise assez le bus pour que le pilote camera laisse
+   * tomber des images - les cam_hal: EV-VSYNC-OVF du demarrage. Camera
+   * pas encore demarree, plus d'images a perdre. */
+  connectWifi();
+
+  if (!initCamera()) { Serial.println("[BOOT] camera absente - arret"); while (true) delay(1000); }
 
 #if SD_BENCH
   /* Une capture suffit a connaitre la taille d'une image, donc le debit
@@ -556,29 +633,6 @@ void setup() {
     }
   }
 #endif
-
-  WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false);
-  WiFi.setHostname(HOSTNAME);
-  /* Pas de setAutoReconnect : le pilote relancerait ses propres tentatives
-   * en parallele de celles de loop(), et chaque begin() tomberait alors
-   * sur "sta is connecting, return error". */
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  Serial.printf("[WIFI] %s", WIFI_SSID);
-  const uint32_t t0 = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) { delay(400); Serial.print('.'); }
-  Serial.println();
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.print("[WIFI] http://"); Serial.println(WiFi.localIP());
-    announceMdns();
-  } else {
-    /* Le pilote continue d'essayer apres notre delai : sans cet arret, la
-     * tentative suivante se superpose et il repond "sta is connecting,
-     * return error". Meme correctif que dans esp32_cam_recorder. */
-    WiFi.disconnect(false);
-    Serial.printf("[WIFI] %s injoignable - nouvelle tentative toutes les %u s\n",
-                  WIFI_SSID, (unsigned)(STA_RETRY_MS / 1000));
-  }
 
   server.on("/",         handleRoot);
   server.on("/shot",     handleShot);
