@@ -160,7 +160,9 @@ static inline void w32(uint8_t* p, uint32_t v) {
 static inline void w16(uint8_t* p, uint16_t v) { p[0] = v; p[1] = v >> 8; }
 
 /* --------------------------- camera ---------------------------------- */
-static bool initCamera() {
+static framesize_t camSize = PHOTO_SIZE;
+
+static bool initCamera(framesize_t fs) {
   camera_config_t c = {};
   c.ledc_channel = LEDC_CHANNEL_0;
   c.ledc_timer   = LEDC_TIMER_0;
@@ -174,7 +176,7 @@ static bool initCamera() {
   c.pin_pwdn  = PWDN_GPIO_NUM;  c.pin_reset = RESET_GPIO_NUM;
   c.xclk_freq_hz = XCLK_FREQ_HZ;
   c.pixel_format = PIXFORMAT_RGB565;      // couleur, aucune compression
-  c.frame_size   = PHOTO_SIZE;            // taille max reservee en PSRAM
+  c.frame_size   = fs;
   c.jpeg_quality = PREVIEW_QUALITY;
   /* Un seul tampon, et le pilote ne capture que lorsqu'il est libre.
    * Avec deux tampons en GRAB_LATEST il remplit en permanence, meme
@@ -202,22 +204,31 @@ static bool initCamera() {
     s->set_whitebal(s, 1);    // la balance des blancs reste automatique :
     s->set_awb_gain(s, 1);    // sans elle le gymnase tire au vert
   }
+  camSize = fs;
   return true;
 }
 
-/* Bascule la definition du capteur, sans redemarrer le pilote : le
- * tampon est deja dimensionne pour PHOTO_SIZE, donc toute taille plus
- * petite y tient. Les deux premieres images apres un changement sortent
- * souvent incompletes, on les jette. */
-static void setFrameSize(framesize_t fs) {
-  sensor_t* s = esp_camera_sensor_get();
-  if (!s) return;
-  s->set_framesize(s, fs);
-  delay(120);
-  for (int i = 0; i < 2; i++) {
+/* Change la definition en redemarrant le pilote.
+ *
+ * set_framesize() seul ne suffit pas en RGB565 : le pilote fige a
+ * l'initialisation le nombre d'octets qu'il attend par image, et refuse
+ * ensuite tout ce qui n'a pas cette taille exacte. Une bascule a chaud
+ * de VGA vers QQVGA donnait donc "cam_hal: FB-SIZE: 38400 != 614400" en
+ * boucle, aucune image, et la carte trop occupee pour repondre. Le JPEG
+ * y echappe parce que sa taille varie de toute facon. */
+static bool setFrameSize(framesize_t fs) {
+  if (fs == camSize) return true;
+  esp_camera_deinit();
+  if (!initCamera(fs)) {
+    Serial.println("[CAM] bascule impossible, retour a la definition photo");
+    initCamera(PHOTO_SIZE);
+    return false;
+  }
+  for (int i = 0; i < 2; i++) {      // les premieres images sont souvent sales
     camera_fb_t* fb = esp_camera_fb_get();
     if (fb) esp_camera_fb_return(fb);
   }
+  return true;
 }
 
 /* ----------------------------- SD ------------------------------------ */
@@ -295,7 +306,12 @@ static bool startRecording() {
 
   /* Le capteur descend a la definition que la carte peut suivre, et y
    * reste jusqu'a l'arret. */
-  setFrameSize(REC_SIZE);
+  if (!setFrameSize(REC_SIZE)) {
+    recFile.close();
+    SD_MMC.remove(recPath);
+    lastMsg = "camera indisponible a cette definition";
+    return false;
+  }
   camera_fb_t* fb = esp_camera_fb_get();
   if (!fb) {
     recFile.close();
@@ -772,7 +788,7 @@ void setup() {
    * pas encore demarree, plus d'images a perdre. */
   connectWifi();
 
-  if (!initCamera()) { Serial.println("[BOOT] camera absente - arret"); while (true) delay(1000); }
+  if (!initCamera(PHOTO_SIZE)) { Serial.println("[BOOT] camera absente - arret"); while (true) delay(1000); }
 
 #if SD_BENCH
   /* Une capture suffit a connaitre la taille d'une image, donc le debit
