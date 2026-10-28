@@ -88,6 +88,8 @@ La page a deux boutons :
 
 - **Prendre une image** -> `GET /shot`, un seul JPEG pris au moment du
   clic (converti juste pour le navigateur). Rien n'est diffuse en continu.
+  La photo est en `PHOTO_SIZE` (640x480 par defaut) : elle ne passe pas
+  par la carte SD, donc rien ne l'oblige a etre minuscule.
 - **Demarrer / arreter l'enregistrement** -> `GET /record?on=1|0`, ecrit
   `/rec_NNNN.rgb` sur la carte SD : **couleur, aucune compression**, les
   octets RGB565 sortis du capteur tels quels.
@@ -110,10 +112,16 @@ qu'il faut, et combien d'images par seconde la carte tient reellement :
 [SD] cette carte tient environ 6.4 images/s a 160x120
 ```
 
-| carte | reglage tenable |
+| carte | `REC_SIZE` / `REC_FPS` tenable |
 | --- | --- |
 | 0,3 Mo/s | QQVGA 160x120 @ 5 i/s (defaut) ou QVGA 320x240 @ 2 i/s |
 | 1,0 Mo/s | QVGA 320x240 @ 5 i/s, ou QQVGA @ 20 i/s |
+
+Seul l'enregistrement est concerne. Le capteur tourne en `PHOTO_SIZE` et
+ne descend en `REC_SIZE` que pendant un enregistrement, puis remonte :
+une carte lente degrade la video, jamais les photos. `PHOTO_SIZE` est
+aussi la taille maximale reservee en PSRAM, on ne peut pas basculer
+au-dessus en cours de route.
 
 Si la carte prend du retard en cours de route, les images en retard sont
 **sautees** et comptees (`sautees` dans la page) au lieu de s'accumuler.

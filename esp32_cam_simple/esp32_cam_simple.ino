@@ -59,7 +59,14 @@ static const char* AP_PASS = "camera123";     // au moins 8 caracteres
  *                      QQVGA 160x120 @ 20 -> 768 ko/s
  * Laisser au moins 30 % de marge : le reste du temps processeur part
  * dans le wifi et la camera.                                            */
-#define FRAME_SIZE       FRAMESIZE_QQVGA // 160x120
+/* Deux definitions, et c'est important : la carte SD ne limite que
+ * l'ENREGISTREMENT. Une photo ne s'ecrit pas sur la carte, rien ne
+ * l'oblige a etre minuscule. Le capteur est donc demarre en PHOTO_SIZE,
+ * et bascule en REC_SIZE le temps d'un enregistrement seulement.
+ * PHOTO_SIZE est aussi la taille maximale reservee en PSRAM : on ne peut
+ * pas basculer plus haut qu'elle en cours de route. */
+#define PHOTO_SIZE       FRAMESIZE_VGA   // 640x480, la photo de /shot
+#define REC_SIZE         FRAMESIZE_QQVGA // 160x120, ce que la carte tient
 #define REC_FPS          5
 #define PREVIEW_QUALITY  10              // qualite du JPEG de /shot seulement
 #define XCLK_FREQ_HZ     10000000
@@ -148,11 +155,17 @@ static bool initCamera() {
   c.pin_pwdn  = PWDN_GPIO_NUM;  c.pin_reset = RESET_GPIO_NUM;
   c.xclk_freq_hz = XCLK_FREQ_HZ;
   c.pixel_format = PIXFORMAT_RGB565;      // couleur, aucune compression
-  c.frame_size   = FRAME_SIZE;
+  c.frame_size   = PHOTO_SIZE;            // taille max reservee en PSRAM
   c.jpeg_quality = PREVIEW_QUALITY;
-  c.grab_mode    = CAMERA_GRAB_LATEST;
+  /* Un seul tampon, et le pilote ne capture que lorsqu'il est libre.
+   * Avec deux tampons en GRAB_LATEST il remplit en permanence, meme
+   * quand personne ne demande d'image, et chaque fois que le wifi
+   * monopolise le bus une trame est perdue en cours de route : ce sont
+   * les cam_hal: EV-VSYNC-OVF. Ici les images sont prises a la demande,
+   * donc rien ne tourne pour rien. */
+  c.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
   c.fb_location  = psramFound() ? CAMERA_FB_IN_PSRAM : CAMERA_FB_IN_DRAM;
-  c.fb_count     = psramFound() ? 2 : 1;
+  c.fb_count     = 1;
 
   const esp_err_t err = esp_camera_init(&c);
   if (err != ESP_OK) {
@@ -167,6 +180,21 @@ static bool initCamera() {
     s->set_awb_gain(s, 1);    // sans elle le gymnase tire au vert
   }
   return true;
+}
+
+/* Bascule la definition du capteur, sans redemarrer le pilote : le
+ * tampon est deja dimensionne pour PHOTO_SIZE, donc toute taille plus
+ * petite y tient. Les deux premieres images apres un changement sortent
+ * souvent incompletes, on les jette. */
+static void setFrameSize(framesize_t fs) {
+  sensor_t* s = esp_camera_sensor_get();
+  if (!s) return;
+  s->set_framesize(s, fs);
+  delay(120);
+  for (int i = 0; i < 2; i++) {
+    camera_fb_t* fb = esp_camera_fb_get();
+    if (fb) esp_camera_fb_return(fb);
+  }
 }
 
 /* ----------------------------- SD ------------------------------------ */
@@ -235,18 +263,27 @@ static bool startRecording() {
     return false;
   }
 
-  camera_fb_t* fb = esp_camera_fb_get();
-  if (!fb) { lastMsg = "capture impossible"; return false; }
-  recW = fb->width; recH = fb->height;
-  recFrameLen = (uint32_t)recW * recH * 2;
-  esp_camera_fb_return(fb);
-
   for (uint16_t i = 1; i < 10000; i++) {
     snprintf(recPath, sizeof(recPath), "/rec_%04u.rgb", i);
     if (!SD_MMC.exists(recPath)) break;
   }
   recFile = SD_MMC.open(recPath, FILE_WRITE);
   if (!recFile) { lastMsg = String("creation impossible: ") + recPath; return false; }
+
+  /* Le capteur descend a la definition que la carte peut suivre, et y
+   * reste jusqu'a l'arret. */
+  setFrameSize(REC_SIZE);
+  camera_fb_t* fb = esp_camera_fb_get();
+  if (!fb) {
+    recFile.close();
+    SD_MMC.remove(recPath);
+    setFrameSize(PHOTO_SIZE);
+    lastMsg = "capture impossible";
+    return false;
+  }
+  recW = fb->width; recH = fb->height;
+  recFrameLen = fb->len;
+  esp_camera_fb_return(fb);
 
   uint8_t h[REC_HEADER_BYTES];
   memset(h, 0, sizeof(h));
@@ -259,6 +296,7 @@ static bool startRecording() {
   w32(h + 16, 0);                // renseigne a l'arret, jamais indispensable
   if (recFile.write(h, REC_HEADER_BYTES) != REC_HEADER_BYTES) {
     recFile.close();
+    setFrameSize(PHOTO_SIZE);
     lastMsg = "ecriture de l'entete impossible";
     return false;
   }
@@ -284,6 +322,7 @@ static void stopRecording(const char* why) {
   recOn = false;
   recFile.flush();
   recFile.close();
+  setFrameSize(PHOTO_SIZE);          // les photos redeviennent nettes
 
   /* Confort uniquement : le fichier se lit deja sans ce chiffre. */
   File patch = SD_MMC.open(recPath, "r+");
@@ -386,7 +425,7 @@ function st(){
     g('rb').className=on?'rec':'';
     g('st').textContent=
       (s.sd?'carte SD ok, '+s.freemb+' Mo libres'+(s.cardmbs?', '+s.cardmbs+' Mo/s':''):'pas de carte SD')+
-      '\n'+s.w+'x'+s.h+' couleur brute, '+s.fps+' i/s = '+s.needmbs+' Mo/s'+
+      '\nenregistrement '+s.w+'x'+s.h+' couleur brute, '+s.fps+' i/s = '+s.needmbs+' Mo/s'+
       (s.ap?'\npoint d\'acces '+s.ap:'')+
       (s.ip?'  /  hotspot '+s.ip:'  /  hotspot non rejoint')+
       (on?'\nenregistre '+s.file+' : '+s.frames+' images, '+s.mb+' Mo, '+s.dropped+' sautees':'')+
@@ -442,7 +481,7 @@ static void handleRecordRoute() {
 
 static void handleStatus() {
   const uint64_t freeMb = (recOn ? recFree : sdFreeBytes()) / (1024ULL * 1024ULL);
-  const uint32_t flen   = recFrameLen ? recFrameLen : (uint32_t)320 * 240 * 2;
+  const uint32_t flen   = recFrameLen ? recFrameLen : (uint32_t)recW * recH * 2;
   const String sta = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString() : String("");
   char j[480];
   snprintf(j, sizeof(j),
@@ -453,7 +492,7 @@ static void handleStatus() {
            sdReady ? "true" : "false", recOn ? "true" : "false",
            (unsigned)recFrames, (double)recFrames * flen / 1048576.0,
            (unsigned)freeMb, (unsigned)recDropped, recOn ? recPath : "",
-           (unsigned)(recW ? recW : 320), (unsigned)(recH ? recH : 240),
+           (unsigned)recW, (unsigned)recH,
            (unsigned)REC_FPS, flen * (double)REC_FPS / 1048576.0,
            (double)sdMbPerSec,
 #if AP_ENABLED || AP_ONLY
@@ -676,15 +715,19 @@ void setup() {
   {
     uint32_t flen = 0;
     uint16_t fw = 0, fh = 0;
+    setFrameSize(REC_SIZE);              // mesurer a la taille reellement ecrite
     camera_fb_t* fb = esp_camera_fb_get();
     if (fb) { flen = fb->len; fw = fb->width; fh = fb->height; esp_camera_fb_return(fb); }
+    setFrameSize(PHOTO_SIZE);
+    /* La page peut deja annoncer ce que couterait un enregistrement. */
+    recW = fw; recH = fh; recFrameLen = flen;
     benchSD(flen);
     if (flen) {
       const float need = (float)flen * REC_FPS / 1048576.0f;
       const float ok   = need * 1.3f;            // 30 % de marge
       Serial.printf("[SD] l'enregistrement demande %.2f Mo/s%s\n", need,
                     (sdMbPerSec > 0.0f && sdMbPerSec < ok)
-                      ? "  <-- carte trop lente, baisser REC_FPS ou FRAME_SIZE" : "");
+                      ? "  <-- carte trop lente, baisser REC_FPS ou REC_SIZE" : "");
       if (sdMbPerSec > 0.0f) {
         Serial.printf("[SD] cette carte tient environ %.1f images/s a %ux%u\n",
                       sdMbPerSec * 1048576.0f / (flen * 1.3f),
