@@ -67,10 +67,24 @@ chacun, ce qui évite de reflasher à chaque essai.
 
 ## Version simple : `esp32_cam_simple/`
 
-Un croquis a part, independant du detecteur. La carte rejoint le hotspot
-du telephone (`WIFI_SSID` / `WIFI_PASS` en haut du fichier) et sert une
-page a deux boutons sur `http://esp32cam.local` ou sur l'adresse affichee
-au port serie :
+Un croquis a part, independant du detecteur.
+
+La carte monte **toujours son propre point d'acces** (`ESP32-CAM` /
+`camera123`, page sur `http://192.168.4.1`) et, en parallele, essaie de
+rejoindre le hotspot du telephone (`WIFI_SSID` / `WIFI_PASS` en haut du
+fichier). Le point d'acces est ce qui garantit que la carte reste
+joignable : un hotspot eteint, passe en 5 GHz ou en WPA3 ne rend plus la
+carte muette. Les tentatives vers le hotspot s'arretent apres
+`STA_MAX_TRY` essais - chacune fait scanner la radio, partagee avec l'AP
+et la camera - et le lien *reessayer le hotspot* de la page les relance.
+`AP_ONLY 1` coupe la station pour de bon.
+
+En cas d'echec, le port serie dit pourquoi et liste les reseaux 2,4 GHz
+visibles avec leur canal, leur niveau et leur chiffrement : un hotspot
+absent de cette liste est en 5 GHz, masque ou eteint, et un hotspot en
+WPA3 seul n'est pas joignable par un ESP32.
+
+La page a deux boutons :
 
 - **Prendre une image** -> `GET /shot`, un seul JPEG pris au moment du
   clic (converti juste pour le navigateur). Rien n'est diffuse en continu.

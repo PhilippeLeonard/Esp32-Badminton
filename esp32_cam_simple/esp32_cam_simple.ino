@@ -35,7 +35,20 @@
 static const char* WIFI_SSID = "Philphone";   // hotspot 2.4 GHz du telephone
 static const char* WIFI_PASS = "12345678";
 static const char* HOSTNAME  = "esp32cam";    // http://esp32cam.local
+
+/* La carte monte TOUJOURS son propre point d'acces, a 192.168.4.1, en
+ * plus d'essayer de rejoindre le hotspot. Brancher le telephone dessus
+ * sort le hotspot du chemin, et surtout la carte reste joignable quand
+ * le hotspot est absent, en 5 GHz, ou simplement eteint. AP_ONLY coupe
+ * la station et ne garde que le point d'acces. */
+#define AP_ENABLED       1
+#define AP_ONLY          0
+static const char* AP_SSID = "ESP32-CAM";
+static const char* AP_PASS = "camera123";     // au moins 8 caracteres
 #define STA_RETRY_MS     60000           // intervalle entre deux tentatives
+#define STA_MAX_TRY      5               // au-dela on arrete la station : chaque
+                                         // tentative fait scanner la radio,
+                                         // partagee avec l'AP et la camera
 
 /* Debit de l'enregistrement = largeur * hauteur * 2 * REC_FPS. La carte
  * SD ne tourne qu'en 1 bit (voir SD_ONE_BIT_MODE plus bas) et le debit
@@ -83,6 +96,7 @@ WebServer server(80);
 
 static bool     sdReady   = false;
 static String   lastMsg   = "";
+static uint8_t  staTries  = 0;        // tentatives de hotspot deja faites
 static float    sdMbPerSec = 0.0f;      // mesure au demarrage, 0 = non mesure
 
 /* ------------------------ enregistrement ------------------------------ *
@@ -358,6 +372,7 @@ static const char PAGE[] PROGMEM = R"HTML(<!doctype html>
 <button id="rb" onclick="rec()">Demarrer l'enregistrement</button>
 <img id="im" alt="">
 <div id="st">...</div>
+<p><a href="#" onclick="fetch('/wifi').then(st);return false">reessayer le hotspot</a></p>
 <div id="fl"></div>
 <script>
 const g=i=>document.getElementById(i);
@@ -372,6 +387,8 @@ function st(){
     g('st').textContent=
       (s.sd?'carte SD ok, '+s.freemb+' Mo libres'+(s.cardmbs?', '+s.cardmbs+' Mo/s':''):'pas de carte SD')+
       '\n'+s.w+'x'+s.h+' couleur brute, '+s.fps+' i/s = '+s.needmbs+' Mo/s'+
+      (s.ap?'\npoint d\'acces '+s.ap:'')+
+      (s.ip?'  /  hotspot '+s.ip:'  /  hotspot non rejoint')+
       (on?'\nenregistre '+s.file+' : '+s.frames+' images, '+s.mb+' Mo, '+s.dropped+' sautees':'')+
       (s.msg?'\n'+s.msg:'');
     files();
@@ -426,18 +443,25 @@ static void handleRecordRoute() {
 static void handleStatus() {
   const uint64_t freeMb = (recOn ? recFree : sdFreeBytes()) / (1024ULL * 1024ULL);
   const uint32_t flen   = recFrameLen ? recFrameLen : (uint32_t)320 * 240 * 2;
-  char j[384];
+  const String sta = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString() : String("");
+  char j[480];
   snprintf(j, sizeof(j),
            "{\"ver\":\"" FW_VERSION "\",\"sd\":%s,\"rec\":%s,\"frames\":%u,"
            "\"mb\":%.1f,\"freemb\":%u,\"dropped\":%u,\"file\":\"%s\","
            "\"w\":%u,\"h\":%u,\"fps\":%u,\"needmbs\":\"%.2f\",\"cardmbs\":\"%.2f\","
-           "\"msg\":\"%s\"}",
+           "\"ap\":\"%s\",\"ip\":\"%s\",\"msg\":\"%s\"}",
            sdReady ? "true" : "false", recOn ? "true" : "false",
            (unsigned)recFrames, (double)recFrames * flen / 1048576.0,
            (unsigned)freeMb, (unsigned)recDropped, recOn ? recPath : "",
            (unsigned)(recW ? recW : 320), (unsigned)(recH ? recH : 240),
            (unsigned)REC_FPS, flen * (double)REC_FPS / 1048576.0,
-           (double)sdMbPerSec, lastMsg.c_str());
+           (double)sdMbPerSec,
+#if AP_ENABLED || AP_ONLY
+           WiFi.softAPIP().toString().c_str(),
+#else
+           "",
+#endif
+           sta.c_str(), lastMsg.c_str());
   cors();
   server.send(200, "application/json", j);
 }
@@ -505,6 +529,15 @@ static void handleDownload() {
                 (unsigned)total, sent == total ? "" : "  <-- TRONQUE");
 }
 
+/* Relance la station apres l'abandon : le telephone est sur l'AP, il
+ * vient d'allumer son hotspot, et rien ne doit obliger a redemarrer. */
+static void handleWifi() {
+  staTries = 0;
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  cors();
+  server.send(200, "text/plain", String("nouvelle tentative vers ") + WIFI_SSID);
+}
+
 static void handleDelete() {
   String f = server.arg("f");
   if (recOn && f == recPath) { cors(); server.send(409, "text/plain", "en cours"); return; }
@@ -564,9 +597,28 @@ static void scanAndReport() {
 }
 
 static void connectWifi() {
+#if AP_ONLY
+  WiFi.mode(WIFI_AP);
+#elif AP_ENABLED
+  WiFi.mode(WIFI_AP_STA);
+#else
   WiFi.mode(WIFI_STA);
+#endif
   WiFi.setSleep(false);
   WiFi.setHostname(HOSTNAME);
+
+#if AP_ENABLED || AP_ONLY
+  /* Monte en premier : quoi qu'il arrive ensuite cote hotspot, la page
+   * est servie. */
+  WiFi.softAP(AP_SSID, AP_PASS);
+  Serial.printf("[AP] \"%s\" / \"%s\"  ->  http://%s\n",
+                AP_SSID, AP_PASS, WiFi.softAPIP().toString().c_str());
+  announceMdns();          // http://esp32cam.local marche aussi sur l'AP
+#endif
+
+#if AP_ONLY
+  return;
+#else
   /* Pas de setAutoReconnect : le pilote relancerait ses propres tentatives
    * en parallele de celles de loop(), et chaque begin() tomberait alors
    * sur "sta is connecting, return error". */
@@ -590,8 +642,13 @@ static void connectWifi() {
   WiFi.disconnect(false);
   Serial.printf("[WIFI] echec: %s (code %d)\n", wifiStatusName(st), st);
   scanAndReport();
-  Serial.printf("[WIFI] nouvelle tentative toutes les %u s\n",
-                (unsigned)(STA_RETRY_MS / 1000));
+  Serial.printf("[WIFI] nouvelle tentative toutes les %u s, %d au total\n",
+                (unsigned)(STA_RETRY_MS / 1000), STA_MAX_TRY);
+#if AP_ENABLED
+  Serial.printf("[WIFI] en attendant, le point d'acces \"%s\" reste disponible\n",
+                AP_SSID);
+#endif
+#endif  // AP_ONLY
 }
 
 void setup() {
@@ -641,6 +698,7 @@ void setup() {
   server.on("/files",    handleFiles);
   server.on("/download", handleDownload);
   server.on("/delete",   handleDelete);
+  server.on("/wifi",     handleWifi);
   server.onNotFound([]() { server.send(404, "text/plain", "404"); });
   server.begin();
   Serial.println("[HTTP] port 80");
@@ -650,24 +708,38 @@ void loop() {
   server.handleClient();
   recordTick();
 
+#if !AP_ONLY
   /* Le hotspot est souvent allume apres la carte, et Android le coupe
-     quand plus personne n'est connecte : on reessaie sans abandonner.
-     Mais chaque tentative fait scanner la radio, partagee avec la camera
-     - c'est ce qui produisait les cam_hal: EV-VSYNC-OVF toutes les
-     secondes. D'ou l'intervalle large et l'arret avant chaque relance. */
+     quand plus personne n'est connecte : on reessaie. Mais chaque
+     tentative fait scanner la radio, partagee avec l'AP et la camera -
+     c'est ce qui produisait les cam_hal: EV-VSYNC-OVF en rafale. D'ou
+     l'intervalle large et l'abandon apres quelques essais : le point
+     d'acces, lui, doit rester net. */
   static uint32_t lastTry = 0;
-  static bool wasUp = false;
-  if (WiFi.status() == WL_CONNECTED) {
-    if (!wasUp) {
-      wasUp = true;
-      Serial.print("[WIFI] connecte, http://"); Serial.println(WiFi.localIP());
-      announceMdns();
-    }
-  } else if (millis() - lastTry > STA_RETRY_MS) {
-    if (wasUp) { wasUp = false; Serial.println("[WIFI] lien perdu"); }
+  static bool     wasUp = false;
+  if (millis() - lastTry > STA_RETRY_MS) {
     lastTry = millis();
-    Serial.printf("[WIFI] tentative vers %s\n", WIFI_SSID);
-    WiFi.disconnect(false);
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    const wl_status_t st = WiFi.status();
+    if (st == WL_CONNECTED) {
+      staTries = 0;
+      if (!wasUp) {
+        wasUp = true;
+        Serial.print("[WIFI] connecte, http://"); Serial.println(WiFi.localIP());
+        announceMdns();
+      }
+    } else if (staTries < STA_MAX_TRY) {
+      if (wasUp) { wasUp = false; Serial.println("[WIFI] lien perdu"); }
+      staTries++;
+      Serial.printf("[WIFI] tentative %u/%u vers \"%s\"\n",
+                    staTries, STA_MAX_TRY, WIFI_SSID);
+      WiFi.disconnect(false);
+      WiFi.begin(WIFI_SSID, WIFI_PASS);
+    } else if (staTries == STA_MAX_TRY) {
+      staTries++;                        // une seule fois
+      WiFi.disconnect(true);
+      Serial.println("[WIFI] hotspot injoignable, station arretee"
+                     " - utiliser le point d'acces, ou /wifi pour reessayer");
+    }
   }
+#endif
 }
