@@ -63,11 +63,16 @@ static const char* AP_PASS = "camera123";     // au moins 8 caracteres
 /* Deux definitions, et c'est important : la carte SD ne limite que
  * l'ENREGISTREMENT. Une photo ne s'ecrit pas sur la carte, rien ne
  * l'oblige a etre minuscule. Le capteur est donc demarre en PHOTO_SIZE,
- * et bascule en REC_SIZE le temps d'un enregistrement seulement.
+ * et bascule en la definition d'enregistrement le temps d'un enregistrement seulement.
  * PHOTO_SIZE est aussi la taille maximale reservee en PSRAM : on ne peut
  * pas basculer plus haut qu'elle en cours de route. */
 #define PHOTO_SIZE       FRAMESIZE_VGA   // 640x480, la photo de /shot
-#define REC_SIZE         FRAMESIZE_QQVGA // 160x120, ce que la carte tient
+/* La definition d'enregistrement depend du format, parce que ce qui
+ * limite n'est pas le meme : en brut c'est le debit de la carte SD, en
+ * JPEG c'est le temps de conversion. Une image JPEG pesant environ douze
+ * fois moins, la contrainte qui imposait le 160x120 disparait. */
+#define REC_SIZE_RAW     FRAMESIZE_QQVGA // 160x120, ce que la carte tient en brut
+#define REC_SIZE_JPEG    FRAMESIZE_VGA   // 640x480 ; QVGA si des images sont sautees
 #define REC_FPS          5
 #define PREVIEW_QUALITY  10              // qualite du JPEG de /shot seulement
 #define XCLK_FREQ_HZ     10000000
@@ -306,7 +311,7 @@ static bool startRecording() {
 
   /* Le capteur descend a la definition que la carte peut suivre, et y
    * reste jusqu'a l'arret. */
-  if (!setFrameSize(REC_SIZE)) {
+  if (!setFrameSize(recJpeg ? REC_SIZE_JPEG : REC_SIZE_RAW)) {
     recFile.close();
     SD_MMC.remove(recPath);
     lastMsg = "camera indisponible a cette definition";
@@ -575,7 +580,12 @@ static void handleStatus() {
            recJpeg ? "true" : "false",
            (unsigned)freeMb, (unsigned)recDropped, recOn ? recPath : "",
            (unsigned)recW, (unsigned)recH,
-           (unsigned)REC_FPS, flen * (double)REC_FPS / 1048576.0,
+           (unsigned)REC_FPS,
+           /* En JPEG le debit reel se mesure, il ne se deduit pas de la
+              definition : une image compressee pese ce que la scene veut. */
+           (recJpeg && recFrames && recStartMs
+              ? (double)recBytes * 1000.0 / (millis() - recStartMs) / 1048576.0
+              : flen * (double)REC_FPS / 1048576.0 / (recJpeg ? 12.0 : 1.0)),
            (double)sdMbPerSec,
 #if AP_ENABLED || AP_ONLY
            WiFi.softAPIP().toString().c_str(),
@@ -797,7 +807,7 @@ void setup() {
   {
     uint32_t flen = 0;
     uint16_t fw = 0, fh = 0;
-    setFrameSize(REC_SIZE);              // mesurer a la taille reellement ecrite
+    setFrameSize(REC_SIZE_RAW);              // mesurer a la taille reellement ecrite
     camera_fb_t* fb = esp_camera_fb_get();
     if (fb) { flen = fb->len; fw = fb->width; fh = fb->height; esp_camera_fb_return(fb); }
     setFrameSize(PHOTO_SIZE);
@@ -809,7 +819,7 @@ void setup() {
       const float ok   = need * 1.3f;            // 30 % de marge
       Serial.printf("[SD] l'enregistrement demande %.2f Mo/s%s\n", need,
                     (sdMbPerSec > 0.0f && sdMbPerSec < ok)
-                      ? "  <-- carte trop lente, baisser REC_FPS ou REC_SIZE" : "");
+                      ? "  <-- carte trop lente, baisser REC_FPS ou REC_SIZE_RAW" : "");
       if (sdMbPerSec > 0.0f) {
         Serial.printf("[SD] cette carte tient environ %.1f images/s a %ux%u\n",
                       sdMbPerSec * 1048576.0f / (flen * 1.3f),
