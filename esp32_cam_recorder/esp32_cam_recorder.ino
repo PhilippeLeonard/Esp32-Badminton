@@ -188,6 +188,7 @@ static uint8_t    burstCount = 0;                // frames in the frozen burst
 static uint8_t    burstOrder[BURST_FRAMES];      // slots, oldest first
 static uint32_t   eventCount = 0;
 static bool       lastSendOk = false;
+static uint8_t    forceLeft  = 0;     // images restantes d'une rafale forcee
 static char       burstFile[32] = {0};
 
 static bool     sdReady  = false;
@@ -812,6 +813,20 @@ static void motionTick() {
   toLuma(fb);
   recordRaw();                        // apres toLuma : c'est elle qui remplit lumaBuf
 
+  /* Rafale demandee a la main depuis le serveur. Elle passe avant le
+     garde-fou : forcer un envoi doit marcher sans terrain ni reference,
+     c'est justement ce qui sert a verifier la liaison. */
+  if (forceLeft) {
+    ringPush(fb);
+    if (--forceLeft == 0) {
+      activeMs = 0;
+      closeEvent();
+      Serial.println("[EVT] rafale forcee envoyee");
+    }
+    esp_camera_fb_return(fb);
+    return;
+  }
+
   /* La detection demande deux choses venues du serveur : une reference et
      un terrain. Sans elles la carte se contente d'enregistrer - c'est le
      mode degrade voulu, pas une panne, et ca evite de declencher des
@@ -1005,6 +1020,20 @@ static void handleZone() {
 }
 
 /* /server?url=http://... — vide pour revenir a l'ecriture SD seule. */
+/* /force?n=10 — capture n images maintenant et les envoie comme une
+   rafale ordinaire. Repond tout de suite : la capture se fait dans la
+   boucle, bloquer le serveur une seconde pour dix images serait inutile. */
+static void handleForce() {
+  int n = server.hasArg("n") ? server.arg("n").toInt() : 10;
+  if (n < 1) n = 1;
+  if (n > BURST_FRAMES) n = BURST_FRAMES;
+  ringCount = ringPos = 0;
+  burstFile[0] = 0;
+  forceLeft = (uint8_t)n;
+  cors();
+  server.send(200, "application/json", String("{\"n\":") + n + "}");
+}
+
 static void handleServer() {
   if (server.hasArg("url")) {
     const String u = server.arg("url");
@@ -1260,6 +1289,7 @@ void setup() {
   server.on("/refimg",    handleRefImg);
   server.on("/zone",      handleZone);
   server.on("/server",    handleServer);
+  server.on("/force",     handleForce);
   server.on("/threshold", handleThreshold);
   server.on("/trigger",   handleTrigger);
   server.on("/calm",      handleCalm);
