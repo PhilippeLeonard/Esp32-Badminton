@@ -1,3 +1,7 @@
+# Bytecode Python
+__pycache__/
+*.pyc
+
 # Sorties de compilation Arduino
 build/
 *.elf
