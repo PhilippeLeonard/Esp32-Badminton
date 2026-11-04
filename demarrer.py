@@ -10,7 +10,9 @@ Enchaine ce qu'il fallait faire a la main :
   1. regenere app_page.h si phone_app.html a change ;
   2. lance serveur.py sur un port libre ;
   3. cherche la carte (nom mDNS, derniere adresse connue, puis balayage
-     du reseau local) et lui dit ou poster ses rafales ;
+     du reseau local), lui dit ou poster ses rafales, et surveille cette
+     liaison jusqu'a l'arret : la carte peut redemarrer ou changer
+     d'adresse, elle est alors reliee a nouveau ;
   4. ouvre la page du serveur dans le navigateur.
 
 Ctrl+C arrete le serveur.
@@ -195,30 +197,24 @@ def relier(hote, mon_url):
         return f"ECHEC: {err}"
 
 
-def preparer_carte(ip_locale, port, impose, stop):
-    """Tourne a cote du serveur : la page doit s'ouvrir tout de suite, meme
-    si la carte est eteinte ou met du temps a rejoindre le hotspot."""
-    hote = trouver_carte(ip_locale, impose, stop)
-    if not hote:
-        dire("carte", "introuvable - le serveur tourne, la page permet de "
-                      "saisir l'adresse a la main")
-        return
+def url_courante(hote):
+    """Ce que la carte a comme adresse de serveur. None si elle ne repond
+    plus du tout - c'est ainsi qu'on voit un redemarrage ou une perte de
+    wifi, et qu'on peut relier a nouveau."""
+    try:
+        with urlopen(f"http://{hote}/server", timeout=3) as f:
+            return f.read().decode("utf-8", "replace").strip()
+    except (URLError, OSError, socket.timeout):
+        return None
 
-    etat = interroger(hote) or {}
+
+def decrire_carte(hote, etat):
     dire("carte", f"trouvee sur http://{hote}  (firmware {etat.get('ver', '?')})")
     if not etat.get("cam", True):
         dire("carte", "ATTENTION : la camera n'a pas demarre sur la carte")
     if not etat.get("sd", True):
         dire("carte", "pas de carte SD : sans serveur joignable, les rafales "
                       "seraient perdues")
-
-    reponse = relier(hote, f"http://{ip_locale}:{port}")
-    if reponse.startswith("ECHEC"):
-        dire("liaison", reponse)
-        return
-    memoriser(hote)
-    dire("liaison", f"la carte postera ses rafales a {reponse or 'ce serveur'}")
-
     manque = []
     if not etat.get("ref"):
         manque.append("la reference")
@@ -227,6 +223,55 @@ def preparer_carte(ip_locale, port, impose, stop):
     if manque:
         dire("a faire", "sur la page : prendre " + " et ".join(manque)
              + " (sans les deux, la carte n'envoie rien)")
+
+
+def preparer_carte(ip_locale, port, impose, stop):
+    """Tourne a cote du serveur, sans fin.
+
+    Un seul passage ne suffisait pas : la carte redemarre (coupure USB,
+    brownout a l'init camera), le hotspot redistribue les baux, et plus
+    rien n'arrivait au serveur alors que les deux tournaient. On verifie
+    donc en continu que la carte repond et qu'elle pointe bien ici, et on
+    la relie des que ce n'est plus le cas."""
+    hote = None
+    attente = 5.0
+    perdue_dite = False
+
+    while not stop.is_set():
+        if hote is None:
+            hote = trouver_carte(ip_locale, impose, stop)
+            if hote is None:
+                if not perdue_dite:
+                    dire("carte", "introuvable - le serveur tourne, la page "
+                                  "permet de saisir l'adresse a la main ; "
+                                  "recherche en arriere-plan")
+                    perdue_dite = True
+                stop.wait(attente)
+                attente = min(attente * 2, 60.0)
+                continue
+            attente = 5.0
+            perdue_dite = False
+            decrire_carte(hote, interroger(hote) or {})
+            memoriser(hote)
+
+        # L'adresse du PC peut changer en cours de route : c'est le hotspot
+        # du telephone qui distribue les baux.
+        mon_url = f"http://{adresse_lan()}:{port}"
+        actuelle = url_courante(hote)
+        if actuelle is None:
+            dire("carte", "ne repond plus - nouvelle recherche")
+            hote = None
+            stop.wait(2)
+            continue
+        if actuelle.rstrip("/") != mon_url:
+            reponse = relier(hote, mon_url)
+            if reponse.startswith("ECHEC"):
+                dire("liaison", reponse)
+                hote = None
+                stop.wait(2)
+                continue
+            dire("liaison", f"la carte postera ses rafales a {reponse or mon_url}")
+        stop.wait(15)
 
 
 # ------------------------------------------------------------------ main
