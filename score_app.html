@@ -93,6 +93,8 @@
     <input type="text" id="espip" placeholder="192.168.4.1" style="flex:1">
     <button class="on" id="espok" style="width:auto;padding:9px 14px;margin:0">Garder</button>
   </div>
+  <button id="relier" class="go">0 &middot; Relier la carte a ce serveur</button>
+  <div class="st" id="relst">la carte ne sait pas encore ou envoyer ses rafales</div>
   <button id="prendreRef">1 &middot; Prendre la reference sur la carte</button>
   <div class="st" id="refst">aucune reference</div>
   <canvas id="refcv" style="width:100%;border-radius:8px;display:none;cursor:crosshair"></canvas>
@@ -280,6 +282,29 @@ document.getElementById("espip").value = esp();
 document.getElementById("espok").onclick = () => {
   localStorage.setItem("espip", document.getElementById("espip").value.trim());
   document.getElementById("refst").textContent = "adresse gardee";
+};
+
+/* Sans cette etape la carte a une adresse de serveur vide, donc elle
+   retombe silencieusement sur la carte SD et rien n'arrive ici. C'est
+   exactement ce qui s'est passe au premier essai. location.host est
+   l'adresse par laquelle ce navigateur joint le serveur : c'est donc
+   celle que la carte doit utiliser, a condition d'etre sur le meme
+   reseau. */
+document.getElementById("relier").onclick = () => {
+  if (!esp()) { document.getElementById("relst").textContent = "adresse de la carte manquante"; return; }
+  const moi = "http://" + location.host;
+  action(document.getElementById("relier"),
+    () => fetch(espUrl("/server?url=" + encodeURIComponent(moi)))
+            .then(r => { if (!r.ok) throw new Error(r.status); return r.text(); }),
+    (ok, res, err) => {
+      /* La carte renvoie l'adresse qu'elle a retenue ; on ne l'affiche
+         que si elle en a bien l'allure, sinon on montre ce qu'on a
+         demande plutot qu'un "ok" sans interet. */
+      document.getElementById("relst").textContent = ok
+        ? "la carte enverra ses rafales a "
+          + (res && res.startsWith("http") ? res : moi)
+        : "echec : " + err.message;
+    });
 };
 
 document.getElementById("prendreRef").onclick = () => {
