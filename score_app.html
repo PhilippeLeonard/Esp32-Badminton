@@ -83,6 +83,22 @@
 <div class="st" id="aide">Les points marques sont les derniers volants detectes. La barre
   verticale est le filet : si les cotes sont inverses, changez "camp de A".</div>
 
+
+<details id="terrainBloc">
+  <summary>Terrain et reference</summary>
+  <div class="st">Adresse de la carte</div>
+  <div class="conn" style="margin:6px 0">
+    <input type="text" id="espip" placeholder="192.168.4.1" style="flex:1">
+    <button class="on" id="espok" style="width:auto;padding:9px 14px;margin:0">Garder</button>
+  </div>
+  <button id="prendreRef">1 &middot; Prendre la reference sur la carte</button>
+  <div class="st" id="refst">aucune reference</div>
+  <canvas id="refcv" style="width:100%;border-radius:8px;display:none;cursor:crosshair"></canvas>
+  <div class="st">Marge autour du terrain : <span id="bandv">40</span> px</div>
+  <input type="range" id="bande" min="0" max="150" value="40" style="width:100%">
+  <button id="envoyerZone" disabled>3 &middot; Envoyer le terrain a la carte</button>
+  <div class="st" id="zonest">clique les 4 coins sur l'image</div>
+</details>
 <details>
   <summary>Reglages</summary>
   <div class="grille">
@@ -207,6 +223,96 @@ function envoyerConfig() {
 $("ligne").oninput = () => { $("lv").textContent = $("ligne").value; fige = Date.now() + 2000;
                              if (E) { E.reglages.ligne = +$("ligne").value; terrain(E); } };
 $("ligne").onchange = envoyerConfig;
+
+/* ---------------- terrain, defini ici et pousse vers la carte ----------------
+ * Le trace se fait sur le PC : cliquer quatre coins sur une image figee ne
+ * demande aucune puissance, alors que le faire depuis la page servie par
+ * l'ESP32 passait par une liaison lente. La carte ne recoit que le
+ * resultat, huit nombres. */
+const esp = () => (localStorage.getItem("espip") || "").trim();
+let coins = [];
+
+function espUrl(p) { return "http://" + esp().replace(/^https?:\/\//, "").replace(/\/.*$/, "") + p; }
+
+document.getElementById("espip").value = esp();
+document.getElementById("espok").onclick = () => {
+  localStorage.setItem("espip", document.getElementById("espip").value.trim());
+  document.getElementById("refst").textContent = "adresse gardee";
+};
+
+document.getElementById("prendreRef").onclick = async () => {
+  if (!esp()) { document.getElementById("refst").textContent = "adresse de la carte manquante"; return; }
+  const b = document.getElementById("prendreRef");
+  b.textContent = "mesure de l'exposition...";
+  try {
+    await fetch(espUrl("/reference"));
+    await chargerRef();
+    coins = [];
+    document.getElementById("zonest").textContent = "clique les 4 coins sur l'image";
+    document.getElementById("envoyerZone").disabled = true;
+    document.getElementById("refst").textContent = "reference prise";
+  } catch (e) {
+    document.getElementById("refst").textContent = "carte injoignable";
+  }
+  b.textContent = "1 · Prendre la reference sur la carte";
+};
+
+let refBmp = null;
+
+async function chargerRef() {
+  const r = await fetch(espUrl("/refimg?t=" + Date.now()));
+  refBmp = await createImageBitmap(await r.blob());
+  const cvr = document.getElementById("refcv");
+  cvr.width = refBmp.width; cvr.height = refBmp.height;
+  cvr.style.display = "";
+  dessinerRef();
+}
+
+/* Le trace est refait entierement a chaque clic : repartir de l'image
+   evite d'empiler des marques fantomes quand on recommence. */
+function dessinerRef() {
+  const cvr = document.getElementById("refcv"), c = cvr.getContext("2d");
+  if (refBmp) c.drawImage(refBmp, 0, 0);
+  c.fillStyle = "#e67e22"; c.strokeStyle = "#e67e22"; c.lineWidth = 2;
+  coins.forEach(([x, y], i) => {
+    c.fillRect(x - 3, y - 3, 7, 7);
+    c.fillText(String(i + 1), x + 6, y - 6);
+  });
+  if (coins.length === 4) {
+    c.beginPath();
+    c.moveTo(coins[0][0], coins[0][1]);
+    for (let i = 1; i < 4; i++) c.lineTo(coins[i][0], coins[i][1]);
+    c.closePath(); c.stroke();
+  }
+}
+
+document.getElementById("refcv").onclick = e => {
+  const cvr = e.target, r = cvr.getBoundingClientRect();
+  /* Le canvas est affiche plus large qu'il n'est : les coins doivent
+     repartir dans le repere du capteur, pas celui de l'ecran. */
+  if (coins.length >= 4) coins = [];
+  coins.push([Math.round((e.clientX - r.left) * cvr.width / r.width),
+              Math.round((e.clientY - r.top) * cvr.height / r.height)]);
+  dessinerRef();
+  document.getElementById("zonest").textContent = coins.length + "/4 coins";
+  document.getElementById("envoyerZone").disabled = coins.length !== 4;
+};
+
+document.getElementById("bande").oninput = () => {
+  document.getElementById("bandv").textContent = document.getElementById("bande").value;
+};
+
+document.getElementById("envoyerZone").onclick = async () => {
+  if (coins.length !== 4) return;
+  const q = coins.map(a => a.join(",")).join(",");
+  try {
+    const r = await fetch(espUrl("/zone?p=" + q + "&band=" + document.getElementById("bande").value));
+    document.getElementById("zonest").textContent =
+      r.ok ? "terrain envoye a la carte" : "la carte a refuse : " + r.status;
+  } catch (e) {
+    document.getElementById("zonest").textContent = "carte injoignable";
+  }
+};
 
 boucle();
 </script>
