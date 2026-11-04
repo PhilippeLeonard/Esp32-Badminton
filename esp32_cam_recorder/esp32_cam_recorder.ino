@@ -808,6 +808,12 @@ static bool postBurst() {
   return ok;
 }
 
+/* prevBuf sert a mesurer le mouvement d'une image a la suivante. Apres un
+ * appel reseau bloquant il a plus d'une seconde, et la comparaison
+ * suivante lirait un mouvement enorme qui n'a pas eu lieu : on repart
+ * d'une image neuve, au prix d'un cycle a 0 %. */
+static void oublierImagePrecedente() { havePrev = false; }
+
 /* Un GET court vers /vivante. Appele hors evenement seulement : la boucle
  * de detection est monotache et un appel reseau la met en pause. */
 static void beat() {
@@ -830,6 +836,7 @@ static void beat() {
     http.GET();
     http.end();
   }
+  oublierImagePrecedente();
 }
 
 static void closeEvent() {
@@ -855,6 +862,7 @@ static void closeEvent() {
   }
   lastSendOk = postBurst();             // le serveur d'abord, sinon la SD
   if (!lastSendOk) writeBurstAvi();
+  oublierImagePrecedente();
   Serial.printf("[EVT] evenement %u : %.1f s de mouvement, %u images, pic %.2f %%\n",
                 (unsigned)eventCount, activeMs / 1000.0f, burstCount, pctIn);
 }
@@ -1155,6 +1163,18 @@ static void handleServer() {
     }
     strncpy(SERVER_URL, u.c_str(), sizeof(SERVER_URL) - 1);
     SERVER_URL[sizeof(SERVER_URL) - 1] = 0;
+
+    /* En NVS, sinon la relecture au demarrage ne trouve jamais rien et
+     * la carte repart muette apres chaque reset. */
+    if (prefs.begin("badminton", false)) {
+      if (SERVER_URL[0]) prefs.putString("srv", SERVER_URL);
+      else               prefs.remove("srv");
+      prefs.end();
+    } else {
+      Serial.println("[CLIP] NVS indisponible, adresse non retenue");
+    }
+
+    beatLast = 0;          // battre tout de suite : le PC attend un signe
     Serial.printf("[CLIP] serveur : %s\n", SERVER_URL[0] ? SERVER_URL : "(aucun)");
   }
   cors();
@@ -1397,11 +1417,10 @@ void setup() {
   /* Adresse du serveur retenue d'une session a l'autre. */
   if (prefs.begin("badminton", true)) {
     const String u = prefs.getString("srv", "");
-    if (u.length() && u.length() < sizeof(SERVER_URL)) {
+    if (u.length() && (size_t)u.length() < sizeof(SERVER_URL)) {
       strncpy(SERVER_URL, u.c_str(), sizeof(SERVER_URL) - 1);
       SERVER_URL[sizeof(SERVER_URL) - 1] = 0;
-      Serial.printf("[CLIP] serveur retenu : %s
-", SERVER_URL);
+      Serial.printf("[CLIP] serveur retenu : %s\n", SERVER_URL);
     }
     prefs.end();
   }
