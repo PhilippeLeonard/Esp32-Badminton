@@ -134,6 +134,14 @@ static uint8_t*  refBuf   = nullptr;   // the reference still
 static uint8_t*  maskBuf  = nullptr;   // working mask, 0x00 or 0xFF
 static uint8_t*  lumaBuf  = nullptr;   // luminance de l'image courante
 static uint8_t*  prevBuf  = nullptr;   // previous frame, for inter-frame motion
+static int16_t  zoneX[4] = {0}, zoneY[4] = {0};
+static uint16_t zoneBand = 40;
+static bool     zoneSet  = false;
+static uint8_t* zoneMap  = nullptr;
+
+/* Resultats de la derniere comparaison a la reference, par zone. */
+static float    pctIn = 0.0f, pctBand = 0.0f;
+static int16_t  maskCx = -1, maskCy = -1;   // centre des pixels changes
 static bool      havePrev = false;
 static uint8_t*  rleBuf   = nullptr;   // encoder output
 static size_t    rleCap   = 0;
@@ -361,6 +369,7 @@ static bool ensureBuffers(camera_fb_t* fb) {
   maskBuf  = (uint8_t*)ps_malloc(grayLen);
   lumaBuf  = (uint8_t*)ps_malloc(grayLen);
   prevBuf  = (uint8_t*)ps_malloc(grayLen);
+  zoneMap  = (uint8_t*)ps_malloc(grayLen);
   rleBuf   = (uint8_t*)ps_malloc(rleCap);
   burstBuf = (uint8_t*)ps_malloc((size_t)BURST_FRAMES * BURST_FRAME_MAX);
 
@@ -430,6 +439,56 @@ static void toLuma(camera_fb_t* fb) {
     const uint8_t r = (px >> 11) & 0x1F, g = (px >> 5) & 0x3F, b = px & 0x1F;
     lumaBuf[i] = (uint8_t)(((r << 3) * 77 + (g << 2) * 150 + (b << 3) * 29) >> 8);
   }
+}
+
+/* ------------------------------ zone --------------------------------- *
+ * Quatre coins places par l'utilisateur, dans n'importe quel ordre de
+ * forme : une camera posee sur le cote voit le terrain en perspective,
+ * un rectangle ne collerait pas. Autour, une marge de zoneBand pixels.
+ *
+ * La classification est calculee une fois par changement de zone, dans
+ * zoneMap : 0 = dehors, 1 = dans le terrain, 2 = dans la marge. Refaire
+ * le test a chaque image coute quatre produits en croix par pixel ; une
+ * table de correspondance ne coute qu'une lecture. */
+
+static bool pointInQuad(float px, float py) {
+  bool in = false;
+  for (int i = 0, j = 3; i < 4; j = i++) {
+    const float xi = zoneX[i], yi = zoneY[i], xj = zoneX[j], yj = zoneY[j];
+    if (((yi > py) != (yj > py)) &&
+        (px < (xj - xi) * (py - yi) / (yj - yi + 1e-6f) + xi)) in = !in;
+  }
+  return in;
+}
+
+static float distToSegment(float px, float py, float ax, float ay, float bx, float by) {
+  const float dx = bx - ax, dy = by - ay;
+  const float len2 = dx * dx + dy * dy;
+  float t = len2 > 0 ? ((px - ax) * dx + (py - ay) * dy) / len2 : 0.0f;
+  t = t < 0 ? 0 : (t > 1 ? 1 : t);
+  const float qx = ax + t * dx - px, qy = ay + t * dy - py;
+  return sqrtf(qx * qx + qy * qy);
+}
+
+static void buildZoneMap() {
+  if (!zoneMap || !grayW) return;
+  for (uint16_t y = 0; y < grayH; y++) {
+    for (uint16_t x = 0; x < grayW; x++) {
+      uint8_t cls = 0;
+      if (pointInQuad(x, y)) {
+        cls = 1;
+      } else {
+        float best = 1e9f;
+        for (int i = 0, j = 3; i < 4; j = i++) {
+          const float d = distToSegment(x, y, zoneX[j], zoneY[j], zoneX[i], zoneY[i]);
+          if (d < best) best = d;
+        }
+        if (best <= zoneBand) cls = 2;
+      }
+      zoneMap[(size_t)y * grayW + x] = cls;
+    }
+  }
+  Serial.printf("[ZONE] carte calculee, marge %u px\n", zoneBand);
 }
 
 /* Percentage of pixels that differ from the PREVIOUS frame.
@@ -842,6 +901,42 @@ static void handleReference() {
   server.send(200, "text/plain", "ok");
 }
 
+/* /zone?p=x0,y0,x1,y1,x2,y2,x3,y3&band=40 — les quatre coins dans l'ordre
+   du contour. Sans argument, renvoie la zone courante. */
+static void handleZone() {
+  const String p = server.arg("p");
+  if (p.length()) {
+    int v[8], n = 0, from = 0;
+    while (n < 8) {
+      const int c = p.indexOf(',', from);
+      v[n++] = p.substring(from, c < 0 ? p.length() : c).toInt();
+      if (c < 0) break;
+      from = c + 1;
+    }
+    if (n == 8) {
+      for (int i = 0; i < 4; i++) { zoneX[i] = v[i * 2]; zoneY[i] = v[i * 2 + 1]; }
+      if (server.hasArg("band")) {
+        const int b = server.arg("band").toInt();
+        if (b >= 0 && b <= 500) zoneBand = (uint16_t)b;
+      }
+      zoneSet = true;
+      buildZoneMap();
+    } else {
+      cors();
+      server.send(400, "text/plain", "il faut huit nombres");
+      return;
+    }
+  }
+  char j[192];
+  snprintf(j, sizeof(j),
+           "{\"set\":%s,\"band\":%u,\"p\":[%d,%d,%d,%d,%d,%d,%d,%d]}",
+           zoneSet ? "true" : "false", (unsigned)zoneBand,
+           zoneX[0], zoneY[0], zoneX[1], zoneY[1],
+           zoneX[2], zoneY[2], zoneX[3], zoneY[3]);
+  cors();
+  server.send(200, "application/json", j);
+}
+
 static void handleThreshold() {
   const int v = server.arg("v").toInt();
   if (v >= 1 && v <= 254) threshold = (uint8_t)v;
@@ -1085,6 +1180,7 @@ void setup() {
   server.on("/snapshot",  handleSnapshot);
   server.on("/reference", handleReference);
   server.on("/refimg",    handleRefImg);
+  server.on("/zone",      handleZone);
   server.on("/threshold", handleThreshold);
   server.on("/trigger",   handleTrigger);
   server.on("/calm",      handleCalm);
