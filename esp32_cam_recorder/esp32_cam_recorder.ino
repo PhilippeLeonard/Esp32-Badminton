@@ -808,15 +808,24 @@ static void motionTick() {
   camera_fb_t* fb = esp_camera_fb_get();
   if (!fb) return;
   if (!ensureBuffers(fb)) { esp_camera_fb_return(fb); return; }
-  if (!haveRef) { esp_camera_fb_return(fb); return; }
+
+  toLuma(fb);
+  recordRaw();                        // apres toLuma : c'est elle qui remplit lumaBuf
+
+  /* La detection demande deux choses venues du serveur : une reference et
+     un terrain. Sans elles la carte se contente d'enregistrer - c'est le
+     mode degrade voulu, pas une panne, et ca evite de declencher des
+     evenements sur une zone que personne n'a definie. */
+  if (!haveRef || !zoneSet) {
+    esp_camera_fb_return(fb);
+    return;
+  }
 
   /* Rolling average over the last few measurements. Frame-to-frame
    * movement is naturally spiky - a shuttle crossing the frame reads
    * 10, 20, 0, 10, 30 - and a single stray low reading in the middle of
    * real movement was enough to start closing the event. Averaging costs
    * nothing and removes that whole class of false ending. */
-  toLuma(fb);
-  recordRaw();                        // apres toLuma : c'est elle qui remplit lumaBuf
   rawPct = interFrameMotion();
   pctHist[pctIndex] = rawPct;
   pctIndex = (pctIndex + 1) % PCT_AVERAGE;
