@@ -175,9 +175,11 @@ function dessiner(e) {
   $("p0").textContent = "+1 " + r.noms[0];
   $("p1").textContent = "+1 " + r.noms[1];
 
-  /* Des que la carte a poste quelque chose, le serveur connait son
-     adresse : la pre-remplir evite de la chercher a la main. */
-  if (e.carte.ip && !esp()) {
+  /* Le serveur connait l'adresse de la carte des son premier battement.
+     On suit cette adresse, pas seulement quand le champ est vide : le
+     hotspot redistribue les baux et une adresse perimee faisait echouer
+     la reference et le terrain, envoyes du navigateur a la carte. */
+  if (e.carte.ip && e.carte.ip !== esp()) {
     localStorage.setItem("espip", e.carte.ip);
     $("espip").value = e.carte.ip;
   }
