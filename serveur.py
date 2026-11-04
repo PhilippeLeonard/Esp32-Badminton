@@ -50,7 +50,8 @@ ENTIERS = ("ligne", "cible", "ecart", "plafond", "jeux_pour_gagner",
 verrou = threading.Lock()
 echanges = []
 reglages = dict(REGLAGES_DEFAUT)
-carte = {"ip": None, "vue": 0, "rssi": None}
+carte = {"ip": None, "vue": 0, "rssi": None, "ver": None,
+         "ref": None, "zone": None}
 clips = []
 
 
@@ -354,6 +355,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         chemin = urlparse(self.path).path
+        params = self._params()
         if chemin == "/":
             if not PAGE.exists():
                 self._texte(500, f"{PAGE.name} introuvable a cote de serveur.py")
@@ -365,6 +367,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._texte(500, f"{PAGE.name} illisible : {err}")
         elif chemin == "/etat":
             self._json(etat())
+        elif chemin == "/vivante":
+            self._vivante(params)
         elif chemin == "/clips":
             with verrou:
                 self._json(clips[-50:])
@@ -408,6 +412,25 @@ class Handler(BaseHTTPRequestHandler):
             self._envoyer(200, "application/octet-stream", f.read_bytes())
         except OSError as err:
             self._texte(500, f"lecture impossible : {err}")
+
+    def _vivante(self, params):
+        """Battement de coeur de la carte, toutes les dix secondes. Sans
+        lui, le serveur n'apprenait l'existence de la carte qu'a la
+        premiere rafale : entre deux echanges la page affichait
+        "carte jamais vue" alors que tout marchait."""
+        def nombre(v):
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                return None
+
+        with verrou:
+            self._vu()
+            carte["rssi"] = nombre(params.get("rssi"))
+            carte["ver"] = params.get("ver") or None
+            carte["ref"] = params.get("ref") == "1"
+            carte["zone"] = params.get("zone") == "1"
+        self._texte(200, "ok")
 
     def _clip(self, params):
         """Rafale envoyee par la carte : [u16 w][u16 h][u8 n] puis
