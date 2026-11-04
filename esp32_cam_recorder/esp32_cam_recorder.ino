@@ -693,14 +693,13 @@ static void motionTick() {
   if (!ensureBuffers(fb)) { esp_camera_fb_return(fb); return; }
   if (!haveRef) { esp_camera_fb_return(fb); return; }
 
-  recordRaw();                        // meme capture, luminance enregistree
-
   /* Rolling average over the last few measurements. Frame-to-frame
    * movement is naturally spiky - a shuttle crossing the frame reads
    * 10, 20, 0, 10, 30 - and a single stray low reading in the middle of
    * real movement was enough to start closing the event. Averaging costs
    * nothing and removes that whole class of false ending. */
   toLuma(fb);
+  recordRaw();                        // apres toLuma : c'est elle qui remplit lumaBuf
   rawPct = interFrameMotion();
   pctHist[pctIndex] = rawPct;
   pctIndex = (pctIndex + 1) % PCT_AVERAGE;
