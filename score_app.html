@@ -19,6 +19,8 @@
          margin:5px 0;width:100%;font-weight:600;background:var(--flat)}
   button.on{background:var(--accent)}button.go{background:var(--go)}
   button.stop{background:var(--stop)}
+  button.attente{background:#b9770e}button.ok{background:var(--go)}button.ko{background:var(--stop)}
+  button:disabled{opacity:.75}
   .row{display:flex;gap:8px}
   .st{font-size:13px;color:var(--muted);margin:5px 0}
   .tableau{display:flex;gap:8px;margin-top:4px}
@@ -98,6 +100,21 @@
   <input type="range" id="bande" min="0" max="150" value="40" style="width:100%">
   <button id="envoyerZone" disabled>3 &middot; Envoyer le terrain a la carte</button>
   <div class="st" id="zonest">clique les 4 coins sur l'image</div>
+
+  <div class="st" style="margin-top:14px">Detection &mdash; appliquee par la carte</div>
+  <div class="grille">
+    <label>Sensibilite par pixel <span id="thv"></span></label>
+    <input type="range" id="thr" min="5" max="120" value="30">
+    <label>Mouvement a partir de <span id="mvv"></span> %</label>
+    <input type="range" id="mov" min="0.2" max="30" step="0.2" value="3">
+    <label>Scene calme sous <span id="cav"></span> %</label>
+    <input type="range" id="cal" min="0.1" max="10" step="0.1" value="0.8">
+    <label>Duree minimale <span id="duv"></span> s</label>
+    <input type="range" id="dur" min="0" max="20" step="0.5" value="5">
+  </div>
+  <button id="envoyerReglages">Envoyer les reglages a la carte</button>
+  <button id="forcer" class="on">Forcer une rafale de 10 images</button>
+  <div class="st" id="detst">la detection ne demarre qu'avec une reference ET un terrain</div>
 </details>
 <details>
   <summary>Reglages</summary>
@@ -230,6 +247,26 @@ $("ligne").onchange = envoyerConfig;
  * l'ESP32 passait par une liaison lente. La carte ne recoit que le
  * resultat, huit nombres. */
 const esp = () => (localStorage.getItem("espip") || "").trim();
+
+/* Un bouton doit rendre la main tout de suite : il passe en "en cours"
+   des le clic, puis en "fait" ou "echec" quand la carte a repondu. Sur
+   une liaison lente, rien ne distinguait sinon un clic ignore d'un clic
+   en train d'aboutir. */
+async function action(btn, fn, dire) {
+  const avant = btn.className;
+  btn.className = "attente";
+  btn.disabled = true;
+  let ok = false, res = null, err = null;
+  /* Delai maximal : une carte debranchee laisse le fetch en suspens, et
+     le bouton restait orange pour toujours - indiscernable d'une requete
+     encore en cours. */
+  const limite = new Promise((_, rej) =>
+    setTimeout(() => rej(new Error("pas de reponse de la carte")), 6000));
+  try { res = await Promise.race([fn(), limite]); ok = true; } catch (e) { err = e; }
+  btn.className = ok ? "ok" : "ko";
+  if (dire) dire(ok, res, err);
+  setTimeout(() => { btn.className = avant; btn.disabled = false; }, 1000);
+}
 let coins = [];
 
 function espUrl(p) { return "http://" + esp().replace(/^https?:\/\//, "").replace(/\/.*$/, "") + p; }
@@ -240,21 +277,17 @@ document.getElementById("espok").onclick = () => {
   document.getElementById("refst").textContent = "adresse gardee";
 };
 
-document.getElementById("prendreRef").onclick = async () => {
+document.getElementById("prendreRef").onclick = () => {
   if (!esp()) { document.getElementById("refst").textContent = "adresse de la carte manquante"; return; }
-  const b = document.getElementById("prendreRef");
-  b.textContent = "mesure de l'exposition...";
-  try {
+  action(document.getElementById("prendreRef"), async () => {
     await fetch(espUrl("/reference"));
     await chargerRef();
     coins = [];
-    document.getElementById("zonest").textContent = "clique les 4 coins sur l'image";
     document.getElementById("envoyerZone").disabled = true;
-    document.getElementById("refst").textContent = "reference prise";
-  } catch (e) {
-    document.getElementById("refst").textContent = "carte injoignable";
-  }
-  b.textContent = "1 · Prendre la reference sur la carte";
+  }, ok => {
+    document.getElementById("refst").textContent = ok ? "reference prise" : "carte injoignable";
+    if (ok) document.getElementById("zonest").textContent = "clique les 4 coins sur l'image";
+  });
 };
 
 let refBmp = null;
@@ -302,16 +335,57 @@ document.getElementById("bande").oninput = () => {
   document.getElementById("bandv").textContent = document.getElementById("bande").value;
 };
 
-document.getElementById("envoyerZone").onclick = async () => {
+document.getElementById("envoyerZone").onclick = () => {
   if (coins.length !== 4) return;
   const q = coins.map(a => a.join(",")).join(",");
-  try {
-    const r = await fetch(espUrl("/zone?p=" + q + "&band=" + document.getElementById("bande").value));
-    document.getElementById("zonest").textContent =
-      r.ok ? "terrain envoye a la carte" : "la carte a refuse : " + r.status;
-  } catch (e) {
-    document.getElementById("zonest").textContent = "carte injoignable";
-  }
+  action(document.getElementById("envoyerZone"),
+    () => fetch(espUrl("/zone?p=" + q + "&band=" + document.getElementById("bande").value))
+            .then(r => { if (!r.ok) throw new Error(r.status); return r.json(); }),
+    (ok, res, err) => {
+      document.getElementById("zonest").textContent =
+        ok ? "terrain envoye, marge " + res.band + " px" : "echec : " + err.message;
+    });
+};
+
+/* ---------------- reglages de detection ----------------
+ * Ils vivent ici mais c'est la carte qui detecte : le serveur ne fait
+ * que les pousser. Un seul envoi pour les quatre, sinon un curseur
+ * bouge et on ne sait plus ce que la carte a vraiment recu. */
+const regl = [
+  ["thr", "thv", "/threshold?v=", v => v],
+  ["mov", "mvv", "/trigger?v=",   v => (+v).toFixed(1)],
+  ["cal", "cav", "/calm?v=",      v => (+v).toFixed(1)],
+  ["dur", "duv", "/minactive?v=", v => (+v).toFixed(1)],
+];
+regl.forEach(([id, out, , fmt]) => {
+  const e = document.getElementById(id);
+  const maj = () => { document.getElementById(out).textContent = fmt(e.value); };
+  e.oninput = maj; maj();
+});
+
+document.getElementById("envoyerReglages").onclick = () => {
+  action(document.getElementById("envoyerReglages"), async () => {
+    for (const [id, , route] of regl) {
+      const v = id === "dur"
+        ? Math.round(document.getElementById(id).value * 1000)   // secondes -> ms
+        : document.getElementById(id).value;
+      const r = await fetch(espUrl(route + v));
+      if (!r.ok) throw new Error(route + " -> " + r.status);
+    }
+  }, (ok, res, err) => {
+    document.getElementById("detst").textContent =
+      ok ? "reglages appliques par la carte" : "echec : " + err.message;
+  });
+};
+
+document.getElementById("forcer").onclick = () => {
+  action(document.getElementById("forcer"),
+    () => fetch(espUrl("/force?n=10")).then(r => { if (!r.ok) throw new Error(r.status); return r.json(); }),
+    (ok, res, err) => {
+      document.getElementById("detst").textContent = ok
+        ? res.n + " images demandees, elles arrivent par /clip"
+        : "echec : " + err.message;
+    });
 };
 
 boucle();
