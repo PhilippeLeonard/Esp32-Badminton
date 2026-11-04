@@ -4,6 +4,11 @@ Détecteur de changement sur Freenove ESP32-WROVER CAM. La carte compare
 chaque image à une référence, n'envoie qu'un **pourcentage**, et ne
 transmet des images que lorsqu'un événement se termine.
 
+Le travail est réparti : le PC trace le terrain et analyse les rafales,
+la carte se contente de mesurer et d'envoyer. **Sans serveur, la carte
+ne détecte rien** et se limite à l'enregistrement brut — c'est le mode
+dégradé voulu en prototype, pas une panne.
+
 ## Disposition du dépôt
 
 ```
@@ -12,15 +17,50 @@ esp32_cam_simple/
 esp32_cam_recorder/
     esp32_cam_recorder.ino   le firmware  <-- ouvrir CE dossier dans l'IDE
     app_page.h               généré, ne pas éditer à la main
-phone_app.html               l'interface web (la source à modifier)
+phone_app.html               la page servie par la carte (source à modifier)
 make_page.py                 phone_app.html  ->  esp32_cam_recorder/app_page.h
+serveur.py                   le serveur : score, terrain, réception des rafales
+score_app.html               la page du serveur
 tools/replay.py              rejoue la détection sur un enregistrement .gray
+tools/rgb_tool.py            convertit les .rgb et .mjpg en AVI lisible
 ```
 
 L'IDE Arduino n'ouvre un croquis que s'il est dans un dossier portant son
 nom. C'est pourquoi le `.ino` est dans `esp32_cam_recorder/` et non à la
 racine : ouvert depuis la racine, l'IDE en fabrique une copie ailleurs, et
 on finit par éditer un fichier pendant qu'on en flashe un autre.
+
+## Mise en route
+
+1. `python serveur.py --port 8000` sur le PC, puis ouvrir sa page.
+2. Dans **Terrain et référence** : saisir l'adresse de la carte.
+3. **Prendre la référence sur la carte** — scène au repos, l'exposition
+   se verrouille et huit images sont moyennées.
+4. Cliquer les **quatre coins** du terrain sur l'image affichée, régler
+   la marge, puis **Envoyer le terrain à la carte**.
+5. Indiquer à la carte où poster ses rafales :
+   `http://ADRESSE_CARTE/server?url=http://ADRESSE_PC:8000`
+
+Le terrain se trace sur le PC parce que cliquer quatre points sur une
+image figée n'y coûte rien, alors que le faire depuis la page servie par
+l'ESP32 passait par une liaison lente pour rien. La carte ne reçoit que
+huit nombres.
+
+Tant que la référence **et** le terrain ne sont pas tous les deux
+définis, la carte ne déclenche aucun événement : rien ne sert de guetter
+un mouvement dans une zone que personne n'a tracée.
+
+### Quand un événement se ferme
+
+Les vingt dernières images partent en un seul `POST /clip`, avec les
+mesures dans l'adresse — pourcentages dans le terrain et dans la marge,
+centre des pixels changés, durée. **Si le POST échoue, la rafale est
+écrite sur la carte SD** : un événement ne se perd pas parce que le PC
+est éteint.
+
+Le serveur range le clip dans `clips/` et, s'il est brut, en sort le pic
+de changement et son centre — c'est ce centre qui situe l'impact. Un
+clip JPEG est stocké sans être analysé : le décoder demanderait Pillow.
 
 ## Modifier l'interface
 
