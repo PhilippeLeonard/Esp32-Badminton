@@ -26,6 +26,7 @@
 #include "img_converters.h"
 #include <WiFi.h>
 #include <WebServer.h>
+#include <HTTPClient.h>
 #include <esp_wifi.h>
 #include <ESPmDNS.h>
 #include "FS.h"
@@ -51,6 +52,11 @@ static const char* HOSTNAME  = "esp32cam";
  * deja connecte a ESP32-CAM est ejecte. Pour un usage par le hotspot,
  * AP_ENABLED reste a 0 ; le mettre a 1 n a d interet que pour joindre
  * la carte sans hotspot du tout. */
+/* Adresse du serveur qui recoit les rafales. Vide ou injoignable, la
+   carte retombe sur l'ecriture SD : en prototype on ne perd pas un
+   evenement parce que le PC n'est pas allume. */
+static char SERVER_URL[96] = "";      // ex: http://192.168.4.2:8000
+
 #define AP_ENABLED   0   // 1 = AP + station; voir la note ci-dessus
 #define AP_ONLY      0
 #define STA_RETRY_MS 20000   // intervalle entre deux tentatives de hotspot
@@ -181,6 +187,7 @@ static uint8_t    ringCount  = 0;                // slots filled, up to BURST_FR
 static uint8_t    burstCount = 0;                // frames in the frozen burst
 static uint8_t    burstOrder[BURST_FRAMES];      // slots, oldest first
 static uint32_t   eventCount = 0;
+static bool       lastSendOk = false;
 static char       burstFile[32] = {0};
 
 static bool     sdReady  = false;
@@ -728,6 +735,50 @@ static void ringPush(camera_fb_t* fb) {
 }
 
 /* Freezes the ring into a burst, oldest frame first. */
+/* Envoie la rafale au serveur en un seul POST. Meme disposition que
+   /burst : [u16 w][u16 h][u8 n] puis [u32 longueur][jpeg] par image. Les
+   mesures voyagent dans l'adresse, le serveur n'a pas a les recalculer. */
+static bool postBurst() {
+  if (!SERVER_URL[0] || !burstCount) return false;
+
+  uint32_t total = 5;
+  for (uint8_t k = 0; k < burstCount; k++) total += 4 + burstLen[burstOrder[k]];
+
+  uint8_t* body = (uint8_t*)ps_malloc(total);
+  if (!body) return false;
+
+  size_t o = 0;
+  w16(body + o, grayW); o += 2;
+  w16(body + o, grayH); o += 2;
+  body[o++] = burstCount;
+  for (uint8_t k = 0; k < burstCount; k++) {
+    const uint8_t slot = burstOrder[k];
+    w32(body + o, burstLen[slot]); o += 4;
+    memcpy(body + o, burstBuf + (size_t)slot * BURST_FRAME_MAX, burstLen[slot]);
+    o += burstLen[slot];
+  }
+
+  char url[256];
+  snprintf(url, sizeof(url),
+           "%s/clip?w=%u&h=%u&n=%u&in=%.2f&band=%.2f&cx=%d&cy=%d&ms=%u",
+           SERVER_URL, (unsigned)grayW, (unsigned)grayH, (unsigned)burstCount,
+           pctIn, pctBand, (int)maskCx, (int)maskCy, (unsigned)activeMs);
+
+  HTTPClient http;
+  http.setConnectTimeout(2500);
+  http.setTimeout(8000);
+  bool ok = false;
+  if (http.begin(url)) {
+    http.addHeader("Content-Type", "application/octet-stream");
+    const int code = http.POST(body, total);
+    ok = (code >= 200 && code < 300);
+    Serial.printf("[CLIP] POST %s -> %d (%u o)\n", url, code, (unsigned)total);
+    http.end();
+  }
+  free(body);
+  return ok;
+}
+
 static void closeEvent() {
   burstCount = ringCount;
   const uint8_t first = (uint8_t)((ringPos + BURST_FRAMES - ringCount) % BURST_FRAMES);
@@ -737,7 +788,14 @@ static void closeEvent() {
   evtState = EVT_READY;
   eventCount++;
   rearmLeft = REARM_CYCLES;
-  writeBurstAvi();
+  /* Le serveur d'abord ; sans lui, la carte SD. */
+  if (postBurst()) {
+    lastSendOk = true;
+    burstFile[0] = 0;
+  } else {
+    lastSendOk = false;
+    writeBurstAvi();
+  }
   Serial.printf("[EVT] event %u: %.1f s of movement, %u frames kept\n",
                 (unsigned)eventCount, activeMs / 1000.0f, burstCount);
 }
@@ -935,6 +993,17 @@ static void handleZone() {
            zoneX[2], zoneY[2], zoneX[3], zoneY[3]);
   cors();
   server.send(200, "application/json", j);
+}
+
+/* /server?url=http://... — vide pour revenir a l'ecriture SD seule. */
+static void handleServer() {
+  if (server.hasArg("url")) {
+    const String u = server.arg("url");
+    strncpy(SERVER_URL, u.c_str(), sizeof(SERVER_URL) - 1);
+    SERVER_URL[sizeof(SERVER_URL) - 1] = 0;
+  }
+  cors();
+  server.send(200, "text/plain", SERVER_URL);
 }
 
 static void handleThreshold() {
@@ -1181,6 +1250,7 @@ void setup() {
   server.on("/reference", handleReference);
   server.on("/refimg",    handleRefImg);
   server.on("/zone",      handleZone);
+  server.on("/server",    handleServer);
   server.on("/threshold", handleThreshold);
   server.on("/trigger",   handleTrigger);
   server.on("/calm",      handleCalm);
