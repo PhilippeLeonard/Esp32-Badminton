@@ -11,13 +11,14 @@
 #include <HTTPClient.h>
 #include <esp_wifi.h>
 #include <ESPmDNS.h>
+#include <Preferences.h>
 #include "FS.h"
 #include "SD_MMC.h"
 #include "app_page.h"       // generated from phone_app.html by make_page.py
 
 /* La page compare cette version a la sienne et affiche les deux quand
  * elles different : il faut alors relancer make_page.py. */
-#define FW_VERSION "1.3.0"
+#define FW_VERSION "1.4.0"
 
 /* ------------------------- 1. Reseau -------------------------------- */
 static const char* WIFI_SSID = "Philphone";   // hotspot 2,4 GHz
@@ -32,8 +33,17 @@ static const char* HOSTNAME  = "esp32cam";    // http://esp32cam.local
 static const char* AP_SSID = "ESP32-CAM";
 static const char* AP_PASS = "camera123";     // au moins 8 caracteres
 
-/* Vide ou injoignable : la carte retombe sur l'ecriture SD. */
+/* Vide ou injoignable : la carte retombe sur l'ecriture SD. L'adresse est
+ * relue en NVS au demarrage : sans cela un simple reset (brownout a
+ * l'init camera, coupure USB) rompait la liaison en silence et le PC
+ * n'entendait plus parler de la carte. */
 static char SERVER_URL[96] = "";              // ex: http://192.168.4.2:8000
+static Preferences prefs;
+
+/* Battement de coeur vers le serveur. Il sert a deux choses : la page du
+ * PC sait que la carte est en vie entre deux echanges, et le serveur
+ * apprend son adresse sans attendre une rafale. */
+#define BEAT_MS      10000
 
 /* ------------------------- 2. Detection ----------------------------- */
 #define FRAME_SIZE        FRAMESIZE_QVGA  // 320x240, chaque pixel est compare
@@ -94,6 +104,7 @@ static const char REC_MAGIC[4] = { 'E', 'S', 'P', 'G' };
 WebServer server(80);
 
 static uint32_t  staLastTry = 0;       // date de la derniere tentative
+static uint32_t  beatLast   = 0;       // date du dernier battement envoye
 static bool      staWasUp   = false;   // etat annonce au dernier passage
 
 static uint8_t*  refBuf   = nullptr;   // l'image de reference
@@ -797,6 +808,30 @@ static bool postBurst() {
   return ok;
 }
 
+/* Un GET court vers /vivante. Appele hors evenement seulement : la boucle
+ * de detection est monotache et un appel reseau la met en pause. */
+static void beat() {
+  if (!SERVER_URL[0] || WiFi.status() != WL_CONNECTED) return;
+  if (evtState == EVT_ACTIVE) return;
+  if (beatLast && millis() - beatLast < BEAT_MS) return;
+  beatLast = millis();
+
+  char url[200];
+  snprintf(url, sizeof(url), "%s/vivante?ver=" FW_VERSION "&rssi=%d&ref=%d&zone=%d",
+           SERVER_URL, (int)WiFi.RSSI(), haveRef ? 1 : 0, zoneSet ? 1 : 0);
+
+  HTTPClient http;
+  /* Delais courts : un serveur eteint ne doit pas couter plus qu'un cycle
+   * de detection perdu. */
+  http.setConnectTimeout(700);
+  http.setTimeout(900);
+  http.setReuse(false);
+  if (http.begin(url)) {
+    http.GET();
+    http.end();
+  }
+}
+
 static void closeEvent() {
   burstCount = ringCount;
   const uint8_t first = (uint8_t)((ringPos + BURST_FRAMES - ringCount) % BURST_FRAMES);
@@ -1359,6 +1394,18 @@ void setup() {
                 AP_SSID, AP_PASS, WiFi.softAPIP().toString().c_str());
 #endif
 
+  /* Adresse du serveur retenue d'une session a l'autre. */
+  if (prefs.begin("badminton", true)) {
+    const String u = prefs.getString("srv", "");
+    if (u.length() && u.length() < sizeof(SERVER_URL)) {
+      strncpy(SERVER_URL, u.c_str(), sizeof(SERVER_URL) - 1);
+      SERVER_URL[sizeof(SERVER_URL) - 1] = 0;
+      Serial.printf("[CLIP] serveur retenu : %s
+", SERVER_URL);
+    }
+    prefs.end();
+  }
+
 #if !AP_ONLY
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   Serial.print("[WIFI] connecting");
@@ -1412,6 +1459,7 @@ void setup() {
 void loop() {
   server.handleClient();
   motionTick();
+  beat();
 
 #if !AP_ONLY
   /* Le hotspot est souvent allume APRES la carte, et Android le coupe
