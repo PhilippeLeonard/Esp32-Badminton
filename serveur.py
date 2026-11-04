@@ -10,12 +10,17 @@ import argparse
 import json
 import os
 import pathlib
+import re
 import socket
 import struct
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlparse
+from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qs, quote, urlparse
+from urllib.request import urlopen
+
+import gray
 
 ICI = pathlib.Path(__file__).parent
 PAGE = ICI / "score_app.html"
@@ -29,6 +34,16 @@ MAX_CLIPS = 500
 # elle borne ce qu'un POST peut faire tenir en memoire.
 MAX_CLIP_OCTETS = 8 * 1024 * 1024
 MAX_CONFIG_OCTETS = 64 * 1024
+
+# Recuperation des fichiers restes sur la carte SD. Un .gray fait 768 ko/s
+# d'enregistrement : la limite est la pour ne pas remplir le disque du PC
+# par megarde, pas parce que le transfert y verrait une difficulte.
+MAX_FICHIER_CARTE = 2 * 1024 * 1024 * 1024
+BLOC_TRANSFERT = 64 * 1024
+# Le lien passe par le wifi de l'ESP32 : lent, mais il doit avancer. Le
+# delai porte sur chaque lecture, pas sur le transfert entier.
+DELAI_CARTE = 30
+NOM_CARTE = re.compile(r"^[A-Za-z0-9_.-]{1,48}$")
 
 REGLAGES_DEFAUT = {
     "noms": ["Joueur A", "Joueur B"],
@@ -53,6 +68,8 @@ reglages = dict(REGLAGES_DEFAUT)
 carte = {"ip": None, "vue": 0, "rssi": None, "ver": None,
          "ref": None, "zone": None}
 clips = []
+transferts = []              # [{id, fichier, etat, recu, total, sortie, erreur}]
+transfert_verrou = threading.Lock()
 
 
 # ------------------------------------------------------------------ clips
@@ -165,6 +182,133 @@ def analyser_brut(frames, w, h, seuil=30):
         "pct_max": round(pcts[k], 2),
         "centre": centres[k],
     }
+
+
+# ----------------------------------------------- fichiers de la carte SD
+
+def nom_carte_ok(nom):
+    """Un nom de fichier de la racine de la carte, et rien d'autre.
+
+    Il part dans une adresse vers la carte : un nom avec un / ou un .. y
+    designerait autre chose que ce qu'on croit.
+    """
+    nom = (nom or "").lstrip("/")
+    if not NOM_CARTE.match(nom) or ".." in nom:
+        return None
+    if not (nom.endswith(".gray") or nom.endswith(".avi")):
+        return None
+    return nom
+
+
+def adresse_carte():
+    """Hote de la carte, appris du battement de coeur ou d'une rafale."""
+    with verrou:
+        return carte["ip"]
+
+
+def _transfert(tid):
+    """A appeler avec transfert_verrou tenu."""
+    for t in transferts:
+        if t["id"] == tid:
+            return t
+    return None
+
+
+def majt(tid, **champs):
+    with transfert_verrou:
+        t = _transfert(tid)
+        if t:
+            t.update(champs)
+
+
+def recuperer_fichier(tid, hote, nom):
+    """Telecharge un fichier de la carte, puis le convertit s'il le faut.
+
+    Le telechargement va directement sur le disque, par blocs : un
+    enregistrement peut peser des centaines de mega-octets, et le garder
+    en memoire ferait tomber le serveur juste au moment ou on essaie
+    enfin de recuperer les images.
+    """
+    cible = CLIPS / nom
+    partiel = cible.with_name(cible.name + ".part")
+    url = f"http://{hote}/download?f=/{quote(nom)}"
+    try:
+        CLIPS.mkdir(exist_ok=True)
+        with urlopen(url, timeout=DELAI_CARTE) as r:
+            total = r.headers.get("Content-Length")
+            total = int(total) if total and total.isdigit() else 0
+            if total > MAX_FICHIER_CARTE:
+                raise ValueError(f"fichier de {total} octets, au-dela de la limite")
+            majt(tid, total=total, etat="telechargement")
+
+            recu = 0
+            with open(partiel, "wb") as out:
+                while True:
+                    bloc = r.read(BLOC_TRANSFERT)
+                    if not bloc:
+                        break
+                    recu += len(bloc)
+                    if recu > MAX_FICHIER_CARTE:
+                        raise ValueError("fichier plus gros que la limite")
+                    out.write(bloc)
+                    majt(tid, recu=recu)
+
+        # La carte annonce une taille : si le compte n'y est pas, le
+        # transfert a ete coupe et le fichier est incomplet.
+        if total and recu != total:
+            raise ValueError(f"transfert incomplet : {recu} octets sur {total}")
+        partiel.replace(cible)
+        print(f"[CARTE] {nom} recupere, {recu} o")
+
+        sortie = cible
+        if nom.endswith(".gray"):
+            majt(tid, etat="conversion")
+            avi = cible.with_suffix(".avi")
+            info = gray.convertir_en_avi(
+                cible, avi, lambda a, b: majt(tid, images=a, images_total=b))
+            sortie = avi
+            print(f"[CARTE] {nom} -> {avi.name} : {info['images']} images "
+                  f"{info['largeur']}x{info['hauteur']}, {info['secondes']:.1f} s")
+            majt(tid, info={k: info[k] for k in
+                            ("largeur", "hauteur", "fps", "images", "secondes",
+                             "images_declarees", "incomplete")})
+
+        majt(tid, etat="termine", sortie=sortie.name, brut=cible.name,
+             fin=time.time())
+    except HTTPError as err:
+        # 409 : la carte enregistre encore dans ce fichier.
+        detail = ""
+        try:
+            detail = err.read().decode("utf-8", "replace").strip()
+        except OSError:
+            pass
+        partiel.unlink(missing_ok=True)
+        majt(tid, etat="echec", fin=time.time(),
+             erreur=f"la carte repond {err.code}" + (f" : {detail}" if detail else ""))
+    except (URLError, OSError, ValueError, gray.GrayInvalide) as err:
+        partiel.unlink(missing_ok=True)
+        majt(tid, etat="echec", fin=time.time(), erreur=str(err))
+        print(f"[CARTE] {nom} : {err}")
+
+
+def lancer_transfert(hote, nom):
+    """Rend (tid, erreur). Le travail se fait dans un fil : un transfert de
+    plusieurs minutes ne doit pas tenir une requete HTTP ouverte."""
+    with transfert_verrou:
+        for t in transferts:
+            if t["fichier"] == nom and t["etat"] not in ("termine", "echec"):
+                return None, "transfert deja en cours pour ce fichier"
+        tid = f"t{int(time.time() * 1000) % 1000000000}{len(transferts)}"
+        transferts.append({
+            "id": tid, "fichier": nom, "etat": "demande", "recu": 0,
+            "total": 0, "sortie": None, "brut": None, "erreur": None,
+            "info": None, "images": 0, "images_total": 0,
+            "debut": time.time(), "fin": None,
+        })
+        del transferts[:-40]
+    threading.Thread(target=recuperer_fichier, args=(tid, hote, nom),
+                     daemon=True).start()
+    return tid, None
 
 
 # ---------------------------------------------------------------- regles
@@ -316,6 +460,36 @@ class Handler(BaseHTTPRequestHandler):
     def _json(self, obj, code=200):
         self._envoyer(code, "application/json; charset=utf-8", json.dumps(obj))
 
+    def _envoyer_fichier(self, chemin, nom_propose=None):
+        """Sert un fichier par blocs.
+
+        Un AVI converti depuis un .gray pese ce que pesait le .gray :
+        le lire en entier en memoire pour le renvoyer, c'etait tenir
+        plusieurs centaines de mega-octets par telechargement.
+        """
+        try:
+            taille = chemin.stat().st_size
+            with open(chemin, "rb") as src:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Length", str(taille))
+                self.send_header("Content-Disposition",
+                                 f'attachment; filename="{nom_propose or chemin.name}"')
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                envoye = 0
+                while envoye < taille:
+                    bloc = src.read(BLOC_TRANSFERT)
+                    if not bloc:
+                        break
+                    self.wfile.write(bloc)
+                    envoye += len(bloc)
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
+        except OSError as err:
+            self._texte(500, f"lecture impossible : {err}")
+
     def _texte(self, code, msg):
         self._envoyer(code, "text/plain; charset=utf-8", msg)
 
@@ -372,6 +546,11 @@ class Handler(BaseHTTPRequestHandler):
         elif chemin == "/clips":
             with verrou:
                 self._json(clips[-50:])
+        elif chemin == "/carte/fichiers":
+            self._carte_fichiers()
+        elif chemin == "/carte/transferts":
+            with transfert_verrou:
+                self._json(list(transferts))
         elif chemin.startswith("/clip/"):
             self._fichier_clip(chemin[len("/clip/"):])
         else:
@@ -393,6 +572,10 @@ class Handler(BaseHTTPRequestHandler):
             self._reset()
         elif chemin == "/config":
             self._config()
+        elif chemin == "/carte/recuperer":
+            self._carte_recuperer(params)
+        elif chemin == "/carte/supprimer":
+            self._carte_supprimer(params)
         else:
             self._texte(404, "404")
 
@@ -408,10 +591,74 @@ class Handler(BaseHTTPRequestHandler):
         if not f.is_file():
             self._texte(404, "clip introuvable")
             return
+        self._envoyer_fichier(f)
+
+    def _carte_fichiers(self):
+        """Liste ce que la carte garde sur sa SD, vue depuis le serveur.
+
+        La page du serveur n'avait aucun moyen d'y acceder : il fallait
+        ouvrir la page de la carte, et ce qu'on en rapportait etait un
+        .gray qu'aucun lecteur n'ouvre.
+        """
+        hote = adresse_carte()
+        if not hote:
+            self._json({"ok": False, "raison": "adresse de la carte inconnue"}, 409)
+            return
         try:
-            self._envoyer(200, "application/octet-stream", f.read_bytes())
-        except OSError as err:
-            self._texte(500, f"lecture impossible : {err}")
+            with urlopen(f"http://{hote}/files", timeout=8) as r:
+                liste = json.loads(r.read().decode("utf-8", "replace"))
+        except (URLError, OSError, ValueError) as err:
+            self._json({"ok": False, "raison": f"carte injoignable : {err}"}, 502)
+            return
+        if not isinstance(liste, list):
+            self._json({"ok": False, "raison": "reponse inattendue de la carte"}, 502)
+            return
+
+        with transfert_verrou:
+            etats = {t["fichier"]: t for t in transferts}
+        for e in liste:
+            if not isinstance(e, dict):
+                continue
+            nom = e.get("n") or ""
+            e["convertible"] = nom.endswith(".gray")
+            e["deja"] = (CLIPS / nom).is_file()
+            t = etats.get(nom)
+            e["transfert"] = t["etat"] if t else None
+        self._json({"ok": True, "ip": hote, "fichiers": liste})
+
+    def _carte_recuperer(self, params):
+        nom = nom_carte_ok(params.get("f"))
+        if not nom:
+            self._json({"ok": False, "raison": "nom de fichier refuse"}, 400)
+            return
+        hote = adresse_carte()
+        if not hote:
+            self._json({"ok": False, "raison": "adresse de la carte inconnue"}, 409)
+            return
+        tid, err = lancer_transfert(hote, nom)
+        if err:
+            self._json({"ok": False, "raison": err}, 409)
+            return
+        print(f"[CARTE] recuperation de {nom} depuis {hote}")
+        self._json({"ok": True, "id": tid, "fichier": nom})
+
+    def _carte_supprimer(self, params):
+        nom = nom_carte_ok(params.get("f"))
+        if not nom:
+            self._json({"ok": False, "raison": "nom de fichier refuse"}, 400)
+            return
+        hote = adresse_carte()
+        if not hote:
+            self._json({"ok": False, "raison": "adresse de la carte inconnue"}, 409)
+            return
+        try:
+            with urlopen(f"http://{hote}/delete?f=/{quote(nom)}", timeout=8) as r:
+                rep = r.read().decode("utf-8", "replace").strip()
+        except (URLError, OSError) as err:
+            self._json({"ok": False, "raison": f"carte injoignable : {err}"}, 502)
+            return
+        print(f"[CARTE] suppression de {nom} : {rep}")
+        self._json({"ok": rep == "ok", "reponse": rep})
 
     def _vivante(self, params):
         """Battement de coeur de la carte, toutes les dix secondes. Sans

@@ -23,6 +23,7 @@ phone_app.html               la page servie par la carte (source à modifier)
 make_page.py                 phone_app.html  ->  esp32_cam_recorder/app_page.h
 serveur.py                   le serveur : score, terrain, réception des rafales
 score_app.html               la page du serveur
+gray.py                      .gray de la carte  ->  AVI lisible
 esp32_cam_simple/
     esp32_cam_simple.ino     croquis à part, indépendant du détecteur
 tools/replay.py              rejoue la détection sur un enregistrement .gray
@@ -160,6 +161,51 @@ python tools/replay.py raw_0001.gray --sweep
 
 balaie une grille de réglages et compte les événements trouvés pour
 chacun, ce qui évite de reflasher à chaque essai.
+
+## Récupérer ce qui est resté sur la carte SD
+
+Deux sortes de fichiers s'accumulent sur la carte :
+
+| fichier | quand | lisible tel quel ? |
+| --- | --- | --- |
+| `evt_NNNN.avi` | le `POST /clip` a échoué, le serveur était éteint | **oui**, MJPEG |
+| `raw_NNNN.gray` | enregistrement brut demandé à la main | **non**, aucun codec |
+
+Un `.gray` n'est lu par aucun lecteur : c'est du gris 8 bits derrière une
+entête de 16 octets. Il faut le convertir, et c'est le serveur qui le
+fait.
+
+Dans la page du serveur, section **Fichiers sur la carte SD** :
+**Lire la carte SD** liste ce qu'elle contient, puis **récupérer** sur une
+ligne rapatrie le fichier et, s'il s'agit d'un `.gray`, écrit l'AVI à
+côté. L'avancement s'affiche — un `.gray` de plusieurs minutes met du
+temps à passer par le Wi-Fi de l'ESP32. Le lien qui apparaît à la fin
+pointe sur le fichier lisible.
+
+Le serveur a besoin de connaître l'adresse de la carte : elle lui arrive
+avec le battement de cœur, donc dès que la carte est reliée. Les fichiers
+atterrissent dans `clips/`, le `.gray` d'origine à côté de l'AVI — la
+conversion ne le remplace pas, c'est lui qui sert à rejouer la détection.
+
+À la main, sans passer par le serveur :
+
+```bash
+python gray.py raw_0001.gray --avi video.avi
+```
+
+```bash
+python gray.py raw_0001.gray --png 0 50 100
+```
+
+L'AVI écrit est un BI_RGB 8 bits à palette de gris : pas de codec, VLC et
+Windows Media Player l'ouvrent directement, et il pèse le même poids que
+le `.gray`. Le nombre d'images se déduit de la **taille du fichier**, pas
+de l'entête : celle-ci n'est corrigée qu'à l'arrêt propre, donc une carte
+débranchée en pleine écriture laisse un compteur à zéro. Une dernière
+image incomplète est ignorée.
+
+`tools/rgb_tool.py` ne sert **pas** à ça : il lit les `.rgb` et `.mjpg` de
+`esp32_cam_simple`, qui sont d'autres formats.
 
 ## Version simple : `esp32_cam_simple/`
 

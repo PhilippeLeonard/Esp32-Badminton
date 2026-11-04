@@ -139,6 +139,11 @@
   </div>
 </details>
 
+<h1>Fichiers sur la carte SD</h1>
+<div class="st" id="sdst">la carte garde ses rafales quand le serveur est injoignable</div>
+<button id="sdlire">Lire la carte SD</button>
+<table id="sdt"></table>
+
 <h1>Journal</h1>
 <table id="journal"><tbody></tbody></table>
 
@@ -438,6 +443,103 @@ document.getElementById("forcer").onclick = () => {
       if (ok) setTimeout(clips, 2500);   // le temps que la carte les envoie
     });
 };
+
+/* ---------------- fichiers restes sur la carte SD ----------------
+ * Un .gray est du gris brut : aucun lecteur ne l'ouvre. Le serveur le
+ * rapatrie et le convertit en AVI, donc c'est lui qu'on interroge, pas
+ * la carte directement. */
+let sdAuto = null;
+
+const ko = b => b > 1048576 ? (b / 1048576).toFixed(1) + " Mo"
+                            : (b / 1024).toFixed(1) + " ko";
+
+async function sdLire() {
+  let d;
+  try {
+    d = await (await fetch("/carte/fichiers", { cache: "no-store" })).json();
+  } catch (e) {
+    document.getElementById("sdst").textContent = "serveur injoignable";
+    return;
+  }
+  const t = document.getElementById("sdt");
+  if (!d.ok) {
+    document.getElementById("sdst").textContent = d.raison || "lecture impossible";
+    t.innerHTML = "";
+    return;
+  }
+  const l = Array.isArray(d.fichiers) ? d.fichiers : [];
+  document.getElementById("sdst").textContent = l.length
+    ? l.length + " fichier(s) sur la carte " + d.ip
+    : "carte " + d.ip + " : rien sur la SD";
+
+  t.innerHTML = "<tr><th>Nom</th><th>Taille</th><th></th><th></th></tr>"
+    + l.map(x => {
+        const etat = x.transfert ? "<span class=\"manuel\">" + x.transfert + "</span>"
+                   : x.deja      ? "deja recupere"
+                   : x.convertible ? "a convertir" : "lisible tel quel";
+        return "<tr><td>" + x.n + "</td><td>" + ko(x.s) + "</td><td>" + etat
+             + "</td><td><a href='#' data-get='" + x.n + "'>recuperer</a>"
+             + "<a href='#' data-sup='" + x.n + "'>supprimer</a></td></tr>";
+      }).join("");
+
+  t.querySelectorAll("[data-get]").forEach(a => a.onclick = async e => {
+    e.preventDefault();
+    const r = await (await fetch("/carte/recuperer?f=" + encodeURIComponent(a.dataset.get),
+                                 { method: "POST" })).json();
+    document.getElementById("sdst").textContent = r.ok
+      ? "recuperation de " + r.fichier + " en cours"
+      : "echec : " + (r.raison || "");
+    sdSuivre();
+  });
+  t.querySelectorAll("[data-sup]").forEach(a => a.onclick = async e => {
+    e.preventDefault();
+    if (!confirm("Supprimer " + a.dataset.sup + " sur la carte ?")) return;
+    const r = await (await fetch("/carte/supprimer?f=" + encodeURIComponent(a.dataset.sup),
+                                 { method: "POST" })).json();
+    if (!r.ok) document.getElementById("sdst").textContent =
+      "suppression refusee : " + (r.raison || r.reponse || "");
+    sdLire();
+  });
+}
+
+/* Pendant un transfert on interroge plus souvent, puis on arrete : un
+   .gray de plusieurs minutes met longtemps a passer par le wifi de la
+   carte, et sans avancement affichee on croit que rien ne se passe. */
+async function sdSuivre() {
+  let l = [];
+  try { l = await (await fetch("/carte/transferts", { cache: "no-store" })).json(); }
+  catch (e) { return; }
+  /* Une reponse inattendue - serveur redemarre, page d'erreur - ferait
+     lever ici, et la boucle d'avancement mourrait sans rien dire. */
+  if (!Array.isArray(l)) return;
+
+  const vifs = l.filter(t => t.etat !== "termine" && t.etat !== "echec");
+  const dernier = l[l.length - 1];
+  if (dernier) {
+    const st = document.getElementById("sdst");
+    if (dernier.etat === "telechargement") {
+      const pc = dernier.total ? " " + (100 * dernier.recu / dernier.total).toFixed(0) + " %" : "";
+      st.textContent = dernier.fichier + " : " + ko(dernier.recu) + pc;
+    } else if (dernier.etat === "conversion") {
+      st.textContent = dernier.fichier + " : conversion "
+                     + dernier.images + "/" + dernier.images_total + " images";
+    } else if (dernier.etat === "echec") {
+      st.textContent = dernier.fichier + " : echec - " + (dernier.erreur || "");
+    } else if (dernier.etat === "termine") {
+      const i = dernier.info;
+      st.innerHTML = dernier.fichier + " -> <a href='/clip/" + dernier.sortie + "'>"
+        + dernier.sortie + "</a>"
+        + (i ? " (" + i.images + " images " + i.largeur + "x" + i.hauteur
+               + ", " + i.secondes.toFixed(1) + " s)" : "");
+    }
+  }
+
+  if (vifs.length && !sdAuto) sdAuto = setInterval(sdSuivre, 1000);
+  if (!vifs.length && sdAuto) { clearInterval(sdAuto); sdAuto = null; sdLire(); }
+}
+
+document.getElementById("sdlire").onclick = sdLire;
+sdSuivre();
 
 clips();
 setInterval(clips, 5000);
