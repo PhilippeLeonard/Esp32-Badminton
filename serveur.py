@@ -201,6 +201,8 @@ class Handler(BaseHTTPRequestHandler):
         elif chemin == "/clips":
             with verrou:
                 self._json(clips[-50:])
+        elif chemin.startswith("/clip/"):
+            self._fichier_clip(chemin[len("/clip/"):])
         else:
             self._envoyer(404, "text/plain; charset=utf-8", "404")
 
@@ -231,6 +233,15 @@ class Handler(BaseHTTPRequestHandler):
         self._envoyer(204, "text/plain", "")
 
     # -- actions
+
+    def _fichier_clip(self, nom):
+        """Telechargement d'un clip recu. Le nom est reduit a sa derniere
+        composante : une adresse ne doit pas pouvoir remonter l'arborescence."""
+        f = CLIPS / pathlib.Path(nom).name
+        if not f.is_file():
+            self._envoyer(404, "text/plain; charset=utf-8", "clip introuvable")
+            return
+        self._envoyer(200, "application/octet-stream", f.read_bytes())
 
     def _clip(self, params):
         """Rafale envoyee par la carte : [u16 w][u16 h][u8 n] puis

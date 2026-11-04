@@ -116,6 +116,11 @@
   <button id="forcer" class="on">Forcer une rafale de 10 images</button>
   <div class="st" id="detst">la detection ne demarre qu'avec une reference ET un terrain</div>
 </details>
+
+<h2 style="font-size:15px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em">
+  Clips recus</h2>
+<div class="st" id="clipst">aucun clip recu</div>
+<table id="clipt" style="width:100%;border-collapse:collapse;font-size:13px"></table>
 <details>
   <summary>Reglages</summary>
   <div class="grille">
@@ -347,6 +352,28 @@ document.getElementById("envoyerZone").onclick = () => {
     });
 };
 
+/* ---------------- clips recus ----------------
+ * Sans cette liste, une rafale arrivee etait invisible : il fallait
+ * aller regarder le dossier clips/ a la main pour savoir si la liaison
+ * avait marche. */
+async function clips() {
+  let l = [];
+  try { l = await (await fetch("/clips")).json(); } catch (e) { return; }
+  const t = document.getElementById("clipt");
+  document.getElementById("clipst").textContent =
+    l.length ? l.length + " clip(s)" : "aucun clip recu";
+  t.innerHTML = l.slice().reverse().map(c => {
+    const h = new Date(c.t * 1000).toLocaleTimeString();
+    const a = c.analyse
+      ? "pic " + c.analyse.pct_max + " % image " + c.analyse.image_max
+        + (c.analyse.centre && c.analyse.centre[0] !== null
+            ? " en (" + c.analyse.centre[0] + "," + c.analyse.centre[1] + ")" : "")
+      : "non analyse (JPEG)";
+    return "<tr><td>" + h + "</td><td>" + c.n + " img " + c.w + "x" + c.h
+         + "</td><td>" + a + "</td><td><a href='/clip/" + c.nom + "'>telecharger</a></td></tr>";
+  }).join("");
+}
+
 /* ---------------- reglages de detection ----------------
  * Ils vivent ici mais c'est la carte qui detecte : le serveur ne fait
  * que les pousser. Un seul envoi pour les quatre, sinon un curseur
@@ -385,8 +412,12 @@ document.getElementById("forcer").onclick = () => {
       document.getElementById("detst").textContent = ok
         ? res.n + " images demandees, elles arrivent par /clip"
         : "echec : " + err.message;
+      if (ok) setTimeout(clips, 2500);   // le temps que la carte les envoie
     });
 };
+
+clips();
+setInterval(clips, 5000);
 
 boucle();
 </script>
