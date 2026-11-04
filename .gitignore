@@ -15,3 +15,6 @@ android-app/
 
 # Etat du match tenu par serveur.py
 match.json
+
+# clips recus par le serveur
+clips/

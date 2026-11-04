@@ -22,6 +22,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 ICI = pathlib.Path(__file__).parent
 PAGE = ICI / "score_app.html"
 SAUVEGARDE = ICI / "match.json"
+CLIPS = ICI / "clips"
 
 REGLAGES_DEFAUT = {
     "noms": ["Joueur A", "Joueur B"],
@@ -41,6 +42,41 @@ verrou = threading.Lock()
 echanges = []                # [{t, j, x, y, src, cellules}]
 reglages = dict(REGLAGES_DEFAUT)
 carte = {"ip": None, "vue": 0, "rssi": None}
+clips = []                   # [{nom, t, n, w, h, in, band, cx, cy, analyse}]
+
+
+# ------------------------------------------------------------------ clips
+
+def analyser_brut(frames, w, h, seuil=30):
+    """Compare chaque image a la premiere, qui sert de reference.
+
+    Travaille sur des images brutes en niveaux de gris : pas de decodage,
+    donc pas de dependance, et les valeurs sont celles du capteur. Rend le
+    pourcentage de pixels changes image par image, l'image ou ce
+    pourcentage est maximal, et le centre des pixels changes a ce
+    moment-la : c'est lui qui situe l'impact."""
+    if len(frames) < 2:
+        return None
+    ref = frames[0]
+    total = w * h
+    pcts, centres = [], []
+    for img in frames[1:]:
+        n = cx = cy = 0
+        for i in range(0, total, 1):
+            d = img[i] - ref[i]
+            if (d if d >= 0 else -d) > seuil:
+                n += 1
+                cx += i % w
+                cy += i // w
+        pcts.append(100.0 * n / total)
+        centres.append((cx // n, cy // n) if n else (None, None))
+    k = max(range(len(pcts)), key=lambda i: pcts[i])
+    return {
+        "pics": [round(v, 2) for v in pcts],
+        "image_max": k + 1,
+        "pct_max": round(pcts[k], 2),
+        "centre": centres[k],
+    }
 
 
 # ---------------------------------------------------------------- regles
@@ -162,6 +198,9 @@ class Handler(BaseHTTPRequestHandler):
                           PAGE.read_text(encoding="utf-8"))
         elif chemin == "/etat":
             self._json(etat())
+        elif chemin == "/clips":
+            with verrou:
+                self._json(clips[-50:])
         else:
             self._envoyer(404, "text/plain; charset=utf-8", "404")
 
@@ -173,7 +212,9 @@ class Handler(BaseHTTPRequestHandler):
                 cle, _, val = part.partition("=")
                 params[cle] = val
 
-        if chemin == "/echange":
+        if chemin == "/clip":
+            self._clip(params)
+        elif chemin == "/echange":
             self._echange()
         elif chemin == "/point":
             self._point(params)
@@ -190,6 +231,59 @@ class Handler(BaseHTTPRequestHandler):
         self._envoyer(204, "text/plain", "")
 
     # -- actions
+
+    def _clip(self, params):
+        """Rafale envoyee par la carte : [u16 w][u16 h][u8 n] puis
+        [u32 longueur][image] par image. Stockee telle quelle, et analysee
+        si elle est brute - un clip JPEG demanderait un decodeur."""
+        n_oct = int(self.headers.get("Content-Length") or 0)
+        if not n_oct:
+            self._envoyer(400, "text/plain", "corps vide")
+            return
+        brut = self.rfile.read(n_oct)
+        if len(brut) < 5:
+            self._envoyer(400, "text/plain", "trop court")
+            return
+
+        w = brut[0] | (brut[1] << 8)
+        h = brut[2] | (brut[3] << 8)
+        n = brut[4]
+        frames, o = [], 5
+        while len(frames) < n and o + 4 <= len(brut):
+            ln = int.from_bytes(brut[o:o + 4], "little")
+            o += 4
+            if o + ln > len(brut):
+                break
+            frames.append(brut[o:o + ln])
+            o += ln
+
+        CLIPS.mkdir(exist_ok=True)
+        nom = time.strftime("evt_%Y%m%d_%H%M%S")
+        jpeg = bool(frames) and frames[0][:2] == bytes((0xFF, 0xD8))
+        chemin = CLIPS / (nom + (".mjpg" if jpeg else ".graypack"))
+        chemin.write_bytes(brut)
+
+        analyse = None
+        if not jpeg and frames and len(frames[0]) == w * h:
+            analyse = analyser_brut(frames, w, h)
+
+        info = {
+            "nom": chemin.name, "t": time.time(), "n": len(frames),
+            "w": w, "h": h,
+            "in": params.get("in"), "band": params.get("band"),
+            "cx": params.get("cx"), "cy": params.get("cy"),
+            "ms": params.get("ms"),
+            "analyse": analyse,
+        }
+        with verrou:
+            carte["ip"] = self.client_address[0]
+            carte["vue"] = time.time()
+            clips.append(info)
+        print("[CLIP] %s : %d images %dx%d, %d o%s"
+              % (chemin.name, len(frames), w, h, len(brut),
+                 "" if analyse is None else
+                 ", pic %.2f%% a l'image %d" % (analyse["pct_max"], analyse["image_max"])))
+        self._json({"ok": True, "nom": chemin.name, "analyse": analyse})
 
     def _echange(self):
         d = self._corps()
