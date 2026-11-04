@@ -394,8 +394,11 @@ async function clips() {
         + (c.analyse.centre && c.analyse.centre[0] !== null
             ? " en (" + c.analyse.centre[0] + "," + c.analyse.centre[1] + ")" : "")
       : "non analyse (JPEG)";
+    /* L'AVI d'abord : c'est le seul des deux qu'un lecteur ouvre. */
+    const liens = (c.avi ? "<a href='/clip/" + c.avi + "'>video</a>" : "")
+                + "<a href='/clip/" + c.nom + "'>brut</a>";
     return "<tr><td>" + h + "</td><td>" + c.n + " img " + c.w + "x" + c.h
-         + "</td><td>" + a + "</td><td><a href='/clip/" + c.nom + "'>telecharger</a></td></tr>";
+         + "</td><td>" + a + "</td><td>" + liens + "</td></tr>";
   }).join("");
 }
 

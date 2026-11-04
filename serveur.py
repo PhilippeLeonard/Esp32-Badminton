@@ -14,6 +14,7 @@ L'adresse a recopier dans config.h (SERVEUR_URL) est affichee au demarrage.
 import argparse
 import json
 import pathlib
+import struct
 import socket
 import threading
 import time
@@ -46,6 +47,73 @@ clips = []                   # [{nom, t, n, w, h, in, band, cx, cy, analyse}]
 
 
 # ------------------------------------------------------------------ clips
+
+def ecrire_avi(chemin, frames, w, h, fps, jpeg):
+    """Ecrit un AVI que VLC et Windows Media Player ouvrent directement.
+
+    Le corps recu de la carte est un format maison : personne ne sait le
+    lire, et demander un outil a chaque clip n'a pas de sens. On convertit
+    donc a l'arrivee, une fois pour toutes.
+
+    Deux cas, meme conteneur : des images JPEG sont recopiees telles
+    quelles (MJPG), des images brutes deviennent un AVI 8 bits avec une
+    palette de gris. Aucun codec a installer dans les deux cas."""
+    n = len(frames)
+    if not n:
+        return None
+    palette = b"" if jpeg else b"".join(bytes((i, i, i, 0)) for i in range(256))
+    strf = 40 + len(palette)
+    strl = 4 + 64 + 8 + strf
+    hdrl = 4 + 64 + 8 + strl
+    tete = 12 + 8 + hdrl + 12
+    movi = sum(8 + len(f) + (len(f) & 1) for f in frames)
+    gros = max(len(f) for f in frames)
+
+    h_ = bytearray(tete)
+    def put(o, b): h_[o:o + len(b)] = b
+    def tg(k, v): return k + struct.pack("<I", v)
+    put(0, tg(b"RIFF", tete - 8 + movi + 8 + 16 * n)); put(8, b"AVI ")
+    put(12, tg(b"LIST", hdrl)); put(20, b"hdrl"); put(24, tg(b"avih", 56))
+    put(32, struct.pack("<I", 1000000 // (fps or 1)))
+    put(36, struct.pack("<I", gros * (fps or 1)))
+    put(44, struct.pack("<I", 0x10)); put(48, struct.pack("<I", n))
+    put(56, struct.pack("<I", 1)); put(60, struct.pack("<I", gros))
+    put(64, struct.pack("<II", w, h))
+    put(88, tg(b"LIST", strl)); put(96, b"strl"); put(100, tg(b"strh", 56))
+    put(108, b"vids"); put(112, b"MJPG" if jpeg else b"DIB ")
+    put(128, struct.pack("<I", 1)); put(132, struct.pack("<I", fps or 1))
+    put(140, struct.pack("<I", n)); put(144, struct.pack("<I", gros))
+    put(148, struct.pack("<I", 0xFFFFFFFF))
+    put(156, struct.pack("<HHHH", 0, 0, w, h))
+    put(164, tg(b"strf", strf))
+    put(172, struct.pack("<IiiHH", 40, w, h, 1, 24 if jpeg else 8))
+    if jpeg:
+        put(188, b"MJPG"); put(192, struct.pack("<I", w * h * 3))
+    else:
+        put(188, struct.pack("<II", 0, w * h))
+        put(204, struct.pack("<II", 256, 256)); put(212, palette)
+    mo = 12 + 8 + hdrl
+    put(mo, tg(b"LIST", 4 + movi)); put(mo + 8, b"movi")
+
+    cle = b"00dc" if jpeg else b"00db"
+    idx = bytearray()
+    off = 4
+    with open(chemin, "wb") as o:
+        o.write(bytes(h_))
+        for f in frames:
+            d = f
+            if not jpeg:
+                # un DIB se lit du bas vers le haut
+                d = b"".join(f[y * w:(y + 1) * w] for y in range(h - 1, -1, -1))
+            o.write(cle + struct.pack("<I", len(d)))
+            o.write(d)
+            if len(d) & 1:
+                o.write(bytes(1))
+            idx += cle + struct.pack("<III", 0x10, off, len(d))
+            off += 8 + len(d) + (len(d) & 1)
+        o.write(b"idx1" + struct.pack("<I", 16 * n))
+        o.write(bytes(idx))
+    return chemin
 
 def analyser_brut(frames, w, h, seuil=30):
     """Compare chaque image a la premiere, qui sert de reference.
@@ -271,15 +339,27 @@ class Handler(BaseHTTPRequestHandler):
         CLIPS.mkdir(exist_ok=True)
         nom = time.strftime("evt_%Y%m%d_%H%M%S")
         jpeg = bool(frames) and frames[0][:2] == bytes((0xFF, 0xD8))
-        chemin = CLIPS / (nom + (".mjpg" if jpeg else ".graypack"))
+
+        """Le corps recu est un format maison. On garde l'original - il
+        peut servir a rejouer un algorithme - mais ce qui s'ouvre d'un
+        double-clic, c'est l'AVI ecrit a cote."""
+        chemin = CLIPS / (nom + ".clip")   # format maison, pas un .mjpg
         chemin.write_bytes(brut)
+        avi = None
+        try:
+            fps = 10
+            avi = ecrire_avi(CLIPS / (nom + ".avi"), frames, w, h, fps, jpeg)
+        except Exception as e:
+            print("[CLIP] conversion AVI impossible :", e)
 
         analyse = None
         if not jpeg and frames and len(frames[0]) == w * h:
             analyse = analyser_brut(frames, w, h)
 
         info = {
-            "nom": chemin.name, "t": time.time(), "n": len(frames),
+            "nom": chemin.name,
+            "avi": (avi.name if avi else None),
+            "t": time.time(), "n": len(frames),
             "w": w, "h": h,
             "in": params.get("in"), "band": params.get("band"),
             "cx": params.get("cx"), "cy": params.get("cy"),
