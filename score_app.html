@@ -93,9 +93,9 @@
     <input type="text" id="espip" placeholder="192.168.4.1" style="flex:1">
     <button class="on" id="espok" style="width:auto;padding:9px 14px;margin:0">Garder</button>
   </div>
-  <button id="relier" class="go">0 &middot; Relier la carte a ce serveur</button>
+  <button id="relier" class="go">1 &middot; Relier la carte a ce serveur</button>
   <div class="st" id="relst">la carte ne sait pas encore ou envoyer ses rafales</div>
-  <button id="prendreRef">1 &middot; Prendre la reference sur la carte</button>
+  <button id="prendreRef">2 &middot; Prendre la reference sur la carte</button>
   <div class="st" id="refst">aucune reference</div>
   <canvas id="refcv" style="width:100%;border-radius:8px;display:none;cursor:crosshair"></canvas>
   <div class="st">Marge autour du terrain : <span id="bandv">40</span> px</div>
@@ -155,8 +155,7 @@ async function appel(chemin, methode = "POST", corps = null) {
   return r.json();
 }
 
-/* Un seul appel en vol a la fois : c'est le serveur du portable, il repond
-   vite, mais empiler les requetes ne sert jamais a rien. */
+/* Un seul appel en vol a la fois : empiler les requetes ne sert a rien. */
 async function boucle() {
   try { dessiner(await appel("/etat", "GET")); } catch (e) {}
   setTimeout(boucle, 700);
@@ -175,6 +174,13 @@ function dessiner(e) {
     ? '<div class="fini">' + r.noms[e.vainqueur] + " gagne le match</div>" : "";
   $("p0").textContent = "+1 " + r.noms[0];
   $("p1").textContent = "+1 " + r.noms[1];
+
+  /* Des que la carte a poste quelque chose, le serveur connait son
+     adresse : la pre-remplir evite de la chercher a la main. */
+  if (e.carte.ip && !esp()) {
+    localStorage.setItem("espip", e.carte.ip);
+    $("espip").value = e.carte.ip;
+  }
 
   const vu = e.carte.depuis;
   $("pastille").className = "pastille" + (vu !== null && vu < 30 ? " ok" : "");
@@ -249,24 +255,18 @@ $("ligne").oninput = () => { $("lv").textContent = $("ligne").value; fige = Date
 $("ligne").onchange = envoyerConfig;
 
 /* ---------------- terrain, defini ici et pousse vers la carte ----------------
- * Le trace se fait sur le PC : cliquer quatre coins sur une image figee ne
- * demande aucune puissance, alors que le faire depuis la page servie par
- * l'ESP32 passait par une liaison lente. La carte ne recoit que le
- * resultat, huit nombres. */
+ * Le trace se fait sur le PC ; la carte ne recoit que huit nombres. */
 const esp = () => (localStorage.getItem("espip") || "").trim();
 
-/* Un bouton doit rendre la main tout de suite : il passe en "en cours"
-   des le clic, puis en "fait" ou "echec" quand la carte a repondu. Sur
-   une liaison lente, rien ne distinguait sinon un clic ignore d'un clic
-   en train d'aboutir. */
+/* Le bouton passe en "en cours" des le clic : sur une liaison lente, rien
+   ne distinguait un clic ignore d'un clic en train d'aboutir. */
 async function action(btn, fn, dire) {
   const avant = btn.className;
   btn.className = "attente";
   btn.disabled = true;
   let ok = false, res = null, err = null;
-  /* Delai maximal : une carte debranchee laisse le fetch en suspens, et
-     le bouton restait orange pour toujours - indiscernable d'une requete
-     encore en cours. */
+  /* Sans delai maximal, une carte debranchee laisse le fetch en suspens
+     et le bouton reste orange pour toujours. */
   const limite = new Promise((_, rej) =>
     setTimeout(() => rej(new Error("pas de reponse de la carte")), 6000));
   try { res = await Promise.race([fn(), limite]); ok = true; } catch (e) { err = e; }
@@ -284,12 +284,10 @@ document.getElementById("espok").onclick = () => {
   document.getElementById("refst").textContent = "adresse gardee";
 };
 
-/* Sans cette etape la carte a une adresse de serveur vide, donc elle
-   retombe silencieusement sur la carte SD et rien n'arrive ici. C'est
-   exactement ce qui s'est passe au premier essai. location.host est
-   l'adresse par laquelle ce navigateur joint le serveur : c'est donc
-   celle que la carte doit utiliser, a condition d'etre sur le meme
-   reseau. */
+/* Sans cette etape la carte a une adresse de serveur vide et retombe
+   silencieusement sur la carte SD. location.host est l'adresse par
+   laquelle ce navigateur joint le serveur : c'est celle que la carte doit
+   utiliser, a condition d'etre sur le meme reseau. */
 document.getElementById("relier").onclick = () => {
   if (!esp()) { document.getElementById("relst").textContent = "adresse de la carte manquante"; return; }
   const moi = "http://" + location.host;
@@ -297,9 +295,8 @@ document.getElementById("relier").onclick = () => {
     () => fetch(espUrl("/server?url=" + encodeURIComponent(moi)))
             .then(r => { if (!r.ok) throw new Error(r.status); return r.text(); }),
     (ok, res, err) => {
-      /* La carte renvoie l'adresse qu'elle a retenue ; on ne l'affiche
-         que si elle en a bien l'allure, sinon on montre ce qu'on a
-         demande plutot qu'un "ok" sans interet. */
+      /* La carte renvoie l'adresse retenue ; on ne l'affiche que si elle
+         en a l'allure. */
       document.getElementById("relst").textContent = ok
         ? "la carte enverra ses rafales a "
           + (res && res.startsWith("http") ? res : moi)
@@ -331,8 +328,8 @@ async function chargerRef() {
   dessinerRef();
 }
 
-/* Le trace est refait entierement a chaque clic : repartir de l'image
-   evite d'empiler des marques fantomes quand on recommence. */
+/* Refait entierement a chaque clic : repartir de l'image evite d'empiler
+   des marques fantomes quand on recommence. */
 function dessinerRef() {
   const cvr = document.getElementById("refcv"), c = cvr.getContext("2d");
   if (refBmp) c.drawImage(refBmp, 0, 0);
@@ -377,10 +374,7 @@ document.getElementById("envoyerZone").onclick = () => {
     });
 };
 
-/* ---------------- clips recus ----------------
- * Sans cette liste, une rafale arrivee etait invisible : il fallait
- * aller regarder le dossier clips/ a la main pour savoir si la liaison
- * avait marche. */
+/* ---------------- clips recus ---------------- */
 async function clips() {
   let l = [];
   try { l = await (await fetch("/clips")).json(); } catch (e) { return; }
@@ -403,9 +397,8 @@ async function clips() {
 }
 
 /* ---------------- reglages de detection ----------------
- * Ils vivent ici mais c'est la carte qui detecte : le serveur ne fait
- * que les pousser. Un seul envoi pour les quatre, sinon un curseur
- * bouge et on ne sait plus ce que la carte a vraiment recu. */
+ * Un seul envoi pour les quatre : sinon un curseur bouge et on ne sait
+ * plus ce que la carte a recu. */
 const regl = [
   ["thr", "thv", "/threshold?v=", v => v],
   ["mov", "mvv", "/trigger?v=",   v => (+v).toFixed(1)],

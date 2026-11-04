@@ -1,26 +1,8 @@
-/* =====================================================================
- *  Freenove ESP32-WROVER CAM - change detector
+/* Freenove ESP32-WROVER CAM - detecteur de changement.
  *
- *  The board watches the scene and sends almost nothing:
- *
- *    1. "Capture reference" freezes exposure and averages a few frames
- *       into a reference still.
- *    2. Ten times a second it compares the live frame to that reference,
- *       pixel by pixel, and keeps ONE number: the percentage of pixels
- *       that changed. /motion returns it in a few dozen bytes.
- *    3. When that percentage crosses the trigger, it captures a burst of
- *       20 mask frames, writes them to the SD card as a lossless .avi,
- *       and holds them in PSRAM for /burst to hand over in one go.
- *
- *  Nothing is streamed. An earlier version pushed every frame over Wi-Fi
- *  and fought the link the whole way: measured on the phone hotspot, the
- *  board had a -35 dBm signal with power save off and still saw 237 ms
- *  average ping with spikes past 1.3 s. Sending a number instead of a
- *  picture makes that latency irrelevant.
- *
- *  Board:   "ESP32 Wrover Module"  (Tools > Board > ESP32 Arduino)
- *           PSRAM: Enabled, Partition scheme: Huge APP (3MB)
- * ===================================================================== */
+ * IDE : carte "ESP32 Wrover Module", PSRAM Enabled,
+ *       Partition Scheme "Huge APP (3MB No OTA)".
+ */
 
 #include "esp_camera.h"
 #include "img_converters.h"
@@ -33,63 +15,50 @@
 #include "SD_MMC.h"
 #include "app_page.h"       // generated from phone_app.html by make_page.py
 
-/* Version announced in /motion. The page carries its own copy and says
- * so when the two differ: that means the page being viewed did not come
- * from the firmware that is running. */
-#define FW_VERSION "1.2.0"
+/* La page compare cette version a la sienne et affiche les deux quand
+ * elles different : il faut alors relancer make_page.py. */
+#define FW_VERSION "1.3.0"
 
-/* ------------------------- 1. Network ------------------------------- */
-static const char* WIFI_SSID = "Philphone";   // 2.4 GHz hotspot
+/* ------------------------- 1. Reseau -------------------------------- */
+static const char* WIFI_SSID = "Philphone";   // hotspot 2,4 GHz
 static const char* WIFI_PASS = "12345678";
-static const char* HOSTNAME  = "esp32cam";
+static const char* HOSTNAME  = "esp32cam";    // http://esp32cam.local
 
-/* The board also runs its own access point, always at 192.168.4.1.
- * Connecting the phone straight to it takes the hotspot - and its
- * latency - out of the path. AP_ONLY skips the hotspot entirely.
- *
- * Mais l AP et la station partagent la meme radio : des que la station
- * s associe, l AP est tire sur le canal du hotspot et le telephone
- * deja connecte a ESP32-CAM est ejecte. Pour un usage par le hotspot,
- * AP_ENABLED reste a 0 ; le mettre a 1 n a d interet que pour joindre
- * la carte sans hotspot du tout. */
-/* Adresse du serveur qui recoit les rafales. Vide ou injoignable, la
-   carte retombe sur l'ecriture SD : en prototype on ne perd pas un
-   evenement parce que le PC n'est pas allume. */
-static char SERVER_URL[96] = "";      // ex: http://192.168.4.2:8000
-
-#define AP_ENABLED   0   // 1 = AP + station; voir la note ci-dessus
+/* AP et station partagent la radio : des que la station s'associe, l'AP
+ * suit le canal du hotspot et ejecte le telephone deja connecte. */
+#define AP_ENABLED   0
 #define AP_ONLY      0
-#define STA_RETRY_MS 20000   // intervalle entre deux tentatives de hotspot
+#define STA_RETRY_MS 20000            // intervalle entre deux tentatives
 static const char* AP_SSID = "ESP32-CAM";
-static const char* AP_PASS = "camera123";     // at least 8 characters
+static const char* AP_PASS = "camera123";     // au moins 8 caracteres
+
+/* Vide ou injoignable : la carte retombe sur l'ecriture SD. */
+static char SERVER_URL[96] = "";              // ex: http://192.168.4.2:8000
 
 /* ------------------------- 2. Detection ----------------------------- */
-#define FRAME_SIZE        FRAMESIZE_QVGA  // 320x240; every pixel is compared
-#define MOTION_HZ         10              // comparisons per second
-#define MOTION_THRESHOLD  30              // per-pixel |live - reference|, 0..255
-#define REF_AVERAGE       8               // frames averaged into the reference
+#define FRAME_SIZE        FRAMESIZE_QVGA  // 320x240, chaque pixel est compare
+#define MOTION_HZ         10              // comparaisons par seconde
+#define MOTION_THRESHOLD  30              // |courant - reference| par pixel, 0..255
+#define REF_AVERAGE       8               // images moyennees dans la reference
 
-/* ------------------------- 3. Event shape --------------------------- *
- * A burst is NOT fired by movement alone - a hand left in frame would
- * then fire for ever. What fires it is a SEQUENCE: the picture moves a
- * lot for a while, then settles back down. The 20 frames handed over are
- * the last two seconds of that movement, kept in a ring buffer, not the
- * stillness that follows it.                                            */
-#define MOVE_PERCENT      3.0f            // % of changed pixels that counts as movement
-#define CALM_PERCENT      0.8f            // % below which the scene is considered settled
-#define MIN_ACTIVE_MS     5000            // movement must last at least this long
-#define PCT_AVERAGE       3               // measurements averaged into the figure used
-#define CALM_CYCLES       8               // consecutive calm cycles that close an event
-#define REARM_CYCLES      10              // calm cycles before a new event may start
+/* ------------------------- 3. Forme d'un evenement ------------------ *
+ * Ce qui declenche est une SEQUENCE : du mouvement soutenu, PUIS un
+ * retour au calme. Le mouvement seul declencherait sans fin sur une main
+ * laissee dans le champ.                                               */
+#define MOVE_PERCENT      3.0f            // % de pixels changes = mouvement
+#define CALM_PERCENT      0.8f            // % sous lequel la scene est calme
+#define MIN_ACTIVE_MS     5000            // duree minimale du mouvement
+#define PCT_AVERAGE       3               // mesures moyennees dans le chiffre utilise
+#define CALM_CYCLES       8               // cycles calmes qui ferment un evenement
+#define REARM_CYCLES      10              // cycles calmes avant un nouvel evenement
 
-/* ------------------------- 4. Burst --------------------------------- */
-#define BURST_FRAMES      20              // frames kept per event
+/* ------------------------- 4. Rafale -------------------------------- */
+#define BURST_FRAMES      20              // images gardees par evenement
 #define BURST_FPS         10
-#define BURST_FRAME_MAX   24576           // PSRAM reserved per burst frame
-#define BURST_QUALITY     8               // JPEG quality of the stored frames
+#define BURST_FRAME_MAX   24576           // PSRAM reservee par image de rafale
+#define BURST_QUALITY     8               // qualite JPEG des images stockees
 
-/* ------------------------- 4. Camera pins --------------------------- */
-/* Freenove ESP32-WROVER CAM (same map as the WROVER-KIT OV2640 board). */
+/* ------------------------- 5. Broches camera ------------------------ */
 #define PWDN_GPIO_NUM    -1
 #define RESET_GPIO_NUM   -1
 #define XCLK_GPIO_NUM    21
@@ -106,111 +75,109 @@ static const char* AP_PASS = "camera123";     // at least 8 characters
 #define VSYNC_GPIO_NUM   25
 #define HREF_GPIO_NUM    23
 #define PCLK_GPIO_NUM    22
-/* 10 MHz, pas 20 : en RGB565 une trame QVGA fait 150 ko ecrits en DMA
- * dans la PSRAM, et a 20 MHz le controleur n arrive plus a suivre - le
- * driver crache alors EV-EOF-OVF / EV-VSYNC-OVF en continu et la radio
- * est noyee avec. En niveaux de gris (75 ko) 20 MHz passait. */
+/* 10 MHz et pas 20 : a 20 MHz le DMA ne suit pas les 150 ko d'une trame
+ * RGB565 et le driver crache EV-EOF-OVF en continu. */
 #define XCLK_FREQ_HZ     10000000
-#define PREVIEW_QUALITY  12               // JPEG quality for /snapshot only
+#define PREVIEW_QUALITY  12               // qualite JPEG de /snapshot seulement
 
-/* ------------------------- 5. Raw recording -------------------------- *
- * A continuous dump of exactly what the sensor produces: 8-bit grayscale,
- * no codec at all. The point is to replay the detection offline on real
- * footage and get the SAME numbers as live - a JPEG would quietly change
- * pixel values and move every threshold. Costs w*h bytes per frame, so
- * QVGA at 10 fps is 768 kB/s: roughly 20 minutes per gigabyte.          */
+/* ------------------------- 6. Enregistrement brut ------------------- *
+ * Gris 8 bits sans codec : 768 ko/s en QVGA a 10 i/s.                  */
 #define REC_FPS           10
 static const char REC_MAGIC[4] = { 'E', 'S', 'P', 'G' };
 
-/* ------------------------- 6. SD card ------------------------------- */
-/* SDMMC pins are IO-MUX fixed on the classic ESP32: CLK 14, CMD 15, D0 2.
- * 1-bit mode frees GPIO4, which the Freenove board shares with its LED. */
+/* ------------------------- 7. Carte SD ------------------------------ */
+/* Broches fixees par l'IO-MUX : CLK 14, CMD 15, D0 2. Le mode 1 bit
+ * libere GPIO4, partage avec la LED et Y2 de la camera. */
 #define SD_ONE_BIT_MODE   true
 #define SD_MOUNT_POINT    "/sdcard"
 
-/* ===================================================================== */
-
 WebServer server(80);
 
-/* --- frame buffers (PSRAM) --- */
 static uint32_t  staLastTry = 0;       // date de la derniere tentative
 static bool      staWasUp   = false;   // etat annonce au dernier passage
 
-static uint8_t*  refBuf   = nullptr;   // the reference still
-static uint8_t*  maskBuf  = nullptr;   // working mask, 0x00 or 0xFF
+static uint8_t*  refBuf   = nullptr;   // l'image de reference
+static uint8_t*  maskBuf  = nullptr;   // masque de travail, 0x00 ou 0xFF
 static uint8_t*  lumaBuf  = nullptr;   // luminance de l'image courante
-static uint8_t*  prevBuf  = nullptr;   // previous frame, for inter-frame motion
-static int16_t  zoneX[4] = {0}, zoneY[4] = {0};
-static uint16_t zoneBand = 40;
-static bool     zoneSet  = false;
-static uint8_t* zoneMap  = nullptr;
-
-/* Resultats de la derniere comparaison a la reference, par zone. */
-static float    pctIn = 0.0f, pctBand = 0.0f;
-static int16_t  maskCx = -1, maskCy = -1;   // centre des pixels changes
-static bool      havePrev = false;
-static uint8_t*  rleBuf   = nullptr;   // encoder output
+static uint8_t*  prevBuf  = nullptr;   // image precedente, pour le mouvement
+static uint8_t*  rleBuf   = nullptr;   // sortie de l'encodeur
 static size_t    rleCap   = 0;
+static bool      havePrev = false;
 static size_t    grayLen  = 0;
 static uint16_t  grayW = 0, grayH = 0;
 
-/* --- detection state --- */
+static int16_t  zoneX[4] = {0}, zoneY[4] = {0};
+static uint16_t zoneBand = 40;
+static bool     zoneSet  = false;
+static uint8_t* zoneMap  = nullptr;    // 0 dehors, 1 terrain, 2 marge
+
+/* Pic de l'evenement en cours, et centre des pixels changes a cet
+ * instant : c'est lui qui situe l'impact. */
+static float    peakIn = 0.0f, peakBand = 0.0f;
+static int16_t  peakCx = -1, peakCy = -1;
+/* Les memes, figes a la fermeture : ce sont ceux qui sont envoyes. */
+static float    pctIn = 0.0f, pctBand = 0.0f;
+static int16_t  maskCx = -1, maskCy = -1;
+
+static bool     cameraOk       = false;
 static bool     haveRef        = false;
 static bool     exposureLocked = false;
 static uint8_t  threshold      = MOTION_THRESHOLD;
 static float    movePct        = MOVE_PERCENT;
 static float    calmPct        = CALM_PERCENT;
 static uint32_t minActiveMs    = MIN_ACTIVE_MS;
-static float    lastPct        = 0.0f;   // inter-frame movement, smoothed
-static float    rawPct         = 0.0f;   // the same figure, unsmoothed
-static float    pctHist[PCT_AVERAGE];    // the last few measurements
+static float    lastPct        = 0.0f;   // mouvement lisse
+static float    rawPct         = 0.0f;   // le meme chiffre, brut
+static float    pctHist[PCT_AVERAGE] = {0};
 static uint8_t  pctCount       = 0;
 static uint8_t  pctIndex       = 0;
 static uint32_t nextMotionMs   = 0;
 
-/* --- event state machine ---
- * WAITING : nothing happening, or still settling after an event.
- * ACTIVE  : movement is under way, frames are going into the ring.
- * READY   : an event closed, its last 20 frames are available.        */
+/* --- machine a etats de l'evenement ---
+ * WAITING : rien en cours, ou retour au calme apres un evenement.
+ * ACTIVE  : du mouvement est en cours, les images entrent dans l'anneau.
+ * READY   : un evenement s'est ferme, ses dernieres images sont la.    */
 enum EvtState { EVT_WAITING = 0, EVT_ACTIVE = 1, EVT_READY = 2 };
 static EvtState evtState    = EVT_WAITING;
-static uint32_t activeStart = 0;         // millis() when movement began
-static uint32_t activeMs    = 0;         // duration of the event just closed
-static uint16_t calmRun     = 0;         // consecutive calm cycles
-static uint16_t rearmLeft   = 0;         // calm cycles still needed to re-arm
+static uint32_t activeStart = 0;         // millis() au debut du mouvement
+static uint32_t activeMs    = 0;         // duree de l'evenement ferme
+static uint16_t calmRun     = 0;         // cycles calmes consecutifs
+static uint16_t rearmLeft   = 0;         // cycles calmes avant de rearmer
 
-/* --- ring of the most recent masks --- */
 static uint8_t*   burstBuf   = nullptr;          // BURST_FRAMES * BURST_FRAME_MAX
-static uint32_t   burstLen[BURST_FRAMES];
-static uint8_t    ringPos    = 0;                // next slot to write
-static uint8_t    ringCount  = 0;                // slots filled, up to BURST_FRAMES
-static uint8_t    burstCount = 0;                // frames in the frozen burst
-static uint8_t    burstOrder[BURST_FRAMES];      // slots, oldest first
+static uint32_t   burstLen[BURST_FRAMES] = {0};
+static uint8_t    ringPos    = 0;                // prochaine case a ecrire
+static uint8_t    ringCount  = 0;                // cases remplies
+static uint8_t    burstCount = 0;                // images de la rafale figee
+static uint8_t    burstOrder[BURST_FRAMES] = {0};// cases, la plus vieille d'abord
 static uint32_t   eventCount = 0;
 static bool       lastSendOk = false;
-static uint8_t    forceLeft  = 0;     // images restantes d'une rafale forcee
+static uint8_t    forceLeft  = 0;      // images restantes d'une rafale forcee
 static char       burstFile[32] = {0};
 
 static bool     sdReady  = false;
 static String   lastError = "";
 
-/* --- raw recording --- */
+/* Prototypes : l'IDE Arduino en genere, mais pas toujours dans l'ordre. */
+static void toLuma(camera_fb_t* fb);
+static void buildMask();
+static void buildZoneMap();
+static bool ensureBuffers(camera_fb_t* fb);
+
 static File     recFile;
 static bool     recOn     = false;
 static uint32_t recFrames = 0;
 static uint32_t recNextMs = 0;
 static char     recPath[32] = {0};
 
-/* ---------------------- little-endian helpers ------------------------ */
+/* ---------------------- ecriture little-endian ----------------------- */
 static inline void w32(uint8_t* p, uint32_t v) {
   p[0] = v; p[1] = v >> 8; p[2] = v >> 16; p[3] = v >> 24;
 }
 static inline void w16(uint8_t* p, uint16_t v) { p[0] = v; p[1] = v >> 8; }
 static inline void tag(uint8_t* p, const char* s) { memcpy(p, s, 4); }
 
-/* ------------------------- AVI (MJPEG) ------------------------------- *
- * The burst holds real camera frames, already JPEG encoded, so they go
- * into the file untouched. Header is a fixed 224 bytes.                 */
+/* ------------------------- AVI (MJPEG) ------------------------------- */
 static const uint32_t AVI_HEADER_BYTES = 224;
 
 static void buildAviHeader(uint8_t* h, uint16_t w, uint16_t ht,
@@ -290,8 +257,7 @@ static bool initCamera() {
     s->set_hmirror(s, 0);
     s->set_brightness(s, 0);
     s->set_contrast(s, 0);
-    /* Automatic exposure stays ON until a reference is taken: forcing it
-     * manually at boot only produces a picture too dark to work with. */
+    /* L'automatique reste actif jusqu'a la prise de reference. */
     s->set_whitebal(s, 1);
     s->set_awb_gain(s, 1);
     s->set_exposure_ctrl(s, 1);
@@ -302,9 +268,9 @@ static bool initCamera() {
   return true;
 }
 
-/* Freeze the sensor at whatever auto-exposure settled on. Without this the
- * sensor re-exposes between the reference and the live frame, every pixel
- * shifts at once, and the mask turns solid black. */
+/* Fige le capteur sur ce que l'automatique a trouve : sinon il re-expose
+ * entre la reference et l'image courante, tous les pixels bougent d'un
+ * coup et le masque devient tout noir. */
 static void lockExposure(bool on) {
   sensor_t* s = esp_camera_sensor_get();
   if (!s) return;
@@ -312,10 +278,8 @@ static void lockExposure(bool on) {
     const int ae = s->status.aec_value;
     const int ag = s->status.agc_gain;
 
-    /* Le capteur ne rapporte pas toujours une exposition exploitable.
-       La reimposer telle quelle quand elle vaut 0 coupe le temps de pose
-       et l'image devient entierement noire : c'est ce qui rendait les
-       enregistrements noirs a partir de la prise de reference. */
+    /* Reimposer une exposition nulle coupe le temps de pose et rend
+     * l'image entierement noire. */
     if (ae <= 0) {
       Serial.println("[CAM] exposition illisible, on reste en automatique");
       exposureLocked = false;
@@ -329,8 +293,8 @@ static void lockExposure(bool on) {
     s->set_aec_value(s, ae);
     s->set_agc_gain(s, ag);
 
-    /* Verification : si l'image est noire apres verrouillage, on rend la
-       main a l'automatique plutot que d'enregistrer du vide. */
+    /* Image noire apres verrouillage : rendre la main a l'automatique
+     * plutot que d'enregistrer du vide. */
     delay(120);
     camera_fb_t* fb = esp_camera_fb_get();
     if (fb) {
@@ -361,17 +325,31 @@ static void lockExposure(bool on) {
   exposureLocked = on;
 }
 
-/* ------------------------- buffers ----------------------------------- */
+/* ------------------------- tampons ---------------------------------- */
+static void freeBuffers() {
+  free(refBuf);   refBuf   = nullptr;
+  free(maskBuf);  maskBuf  = nullptr;
+  free(lumaBuf);  lumaBuf  = nullptr;
+  free(prevBuf);  prevBuf  = nullptr;
+  free(zoneMap);  zoneMap  = nullptr;
+  free(rleBuf);   rleBuf   = nullptr;
+  free(burstBuf); burstBuf = nullptr;
+  haveRef = havePrev = false;
+  /* zoneMap avait la geometrie d'avant : la garder "definie" ferait lire
+   * une table qui ne correspond plus a l'image. */
+  zoneSet   = false;
+  ringCount = ringPos = burstCount = 0;
+  evtState  = EVT_WAITING;
+}
+
 static bool ensureBuffers(camera_fb_t* fb) {
   if (grayLen == (size_t)fb->width * fb->height && refBuf) return true;
 
-  free(refBuf); free(maskBuf); free(lumaBuf); free(prevBuf); free(rleBuf); free(burstBuf);
-  refBuf = maskBuf = lumaBuf = prevBuf = rleBuf = burstBuf = nullptr;
-  haveRef = havePrev = false;
+  freeBuffers();
 
   grayW = fb->width; grayH = fb->height;
-  grayLen = (size_t)grayW * grayH;        // la luminance, pas la trame RGB565
-  rleCap  = grayLen * 2 + 16;              // worst case: alternating pixels
+  grayLen = (size_t)grayW * grayH;         // la luminance, pas la trame RGB565
+  rleCap  = grayLen * 2 + 16;              // pire cas : un pixel sur deux
 
   refBuf   = (uint8_t*)ps_malloc(grayLen);
   maskBuf  = (uint8_t*)ps_malloc(grayLen);
@@ -381,32 +359,38 @@ static bool ensureBuffers(camera_fb_t* fb) {
   rleBuf   = (uint8_t*)ps_malloc(rleCap);
   burstBuf = (uint8_t*)ps_malloc((size_t)BURST_FRAMES * BURST_FRAME_MAX);
 
-  if (!refBuf || !maskBuf || !lumaBuf || !prevBuf || !rleBuf || !burstBuf) {
-    lastError = "Out of PSRAM";
-    Serial.println("[MEM] allocation failed");
-    grayLen = 0;
+  if (!refBuf || !maskBuf || !lumaBuf || !prevBuf || !zoneMap || !rleBuf || !burstBuf) {
+    /* Tout ou rien : une allocation partielle laisserait des pointeurs
+     * nuls lus plus loin comme s'ils etaient valides. */
+    freeBuffers();
+    lastError = "PSRAM insuffisante";
+    Serial.println("[MEM] allocation impossible");
+    grayLen = 0; grayW = grayH = 0;
     return false;
   }
-  Serial.printf("[MEM] %ux%u ready, %u kB PSRAM free\n",
+  memset(zoneMap, 0, grayLen);
+  Serial.printf("[MEM] %ux%u pret, %u ko de PSRAM libre\n",
                 grayW, grayH, (unsigned)(ESP.getFreePsram() / 1024));
   return true;
 }
 
-/* Average several frames into the reference. One frame carries sensor
- * noise straight into the comparison, which speckles every later mask and
- * drowns the shape of whatever actually moved. */
 static bool captureReference() {
   lockExposure(true);
-  delay(150);                                    // let the locked settings land
+  delay(150);                              // laisser les reglages s'appliquer
 
   camera_fb_t* fb = esp_camera_fb_get();
-  if (!fb) { lastError = "Camera capture failed"; return false; }
+  if (!fb) { lastError = "capture camera impossible"; return false; }
   if (!ensureBuffers(fb)) { esp_camera_fb_return(fb); return false; }
+  /* RGB565 = deux octets par pixel ; plus court, toLuma lirait dehors. */
+  if (fb->len < grayLen * 2) {
+    esp_camera_fb_return(fb);
+    lastError = "trame camera incomplete";
+    return false;
+  }
 
-  /* The accumulator lives in PSRAM: 320x240 uint32 is 300 kB, which does
-   * not fit in the ESP32's internal DRAM at all. */
+  /* En PSRAM : 320x240 uint32 fait 300 ko, hors de la DRAM interne. */
   uint32_t* acc = (uint32_t*)ps_malloc(grayLen * sizeof(uint32_t));
-  if (!acc) { esp_camera_fb_return(fb); lastError = "Out of PSRAM"; return false; }
+  if (!acc) { esp_camera_fb_return(fb); lastError = "PSRAM insuffisante"; return false; }
 
   toLuma(fb);
   for (size_t i = 0; i < grayLen; i++) acc[i] = lumaBuf[i];
@@ -417,7 +401,7 @@ static bool captureReference() {
     delay(40);
     camera_fb_t* f = esp_camera_fb_get();
     if (!f) continue;
-    if ((size_t)f->width * f->height == grayLen) {
+    if ((size_t)f->width * f->height == grayLen && f->len >= grayLen * 2) {
       toLuma(f);
       for (size_t i = 0; i < grayLen; i++) acc[i] += lumaBuf[i];
       used++;
@@ -428,18 +412,20 @@ static bool captureReference() {
   free(acc);
 
   haveRef   = true;
-  pctCount  = pctIndex = 0;           // the average must not carry over
+  pctCount  = pctIndex = 0;           // la moyenne ne doit pas se reporter
+  havePrev  = false;                  // ni l'image precedente
   evtState  = EVT_WAITING;
   rearmLeft = 0;
-  ringCount = ringPos = 0;
+  ringCount = ringPos = burstCount = 0;
+  peakIn = peakBand = 0.0f;
+  peakCx = peakCy = -1;
   lastError = "";
-  Serial.printf("[REF] reference averaged over %d frames (%ux%u)\n",
-                REF_AVERAGE, grayW, grayH);
+  Serial.printf("[REF] reference moyennee sur %u images (%ux%u)\n",
+                (unsigned)used, grayW, grayH);
   return true;
 }
 
-/* RGB565 -> luminance. Le capteur donne de la couleur pour les images de
-   rafale ; la detection, elle, ne travaille que sur la luminance. */
+/* RGB565 -> luminance : la detection ne travaille que la-dessus. */
 static void toLuma(camera_fb_t* fb) {
   const uint8_t* p = fb->buf;
   for (size_t i = 0; i < grayLen; i++) {
@@ -449,15 +435,10 @@ static void toLuma(camera_fb_t* fb) {
   }
 }
 
-/* ------------------------------ zone --------------------------------- *
- * Quatre coins places par l'utilisateur, dans n'importe quel ordre de
- * forme : une camera posee sur le cote voit le terrain en perspective,
- * un rectangle ne collerait pas. Autour, une marge de zoneBand pixels.
- *
- * La classification est calculee une fois par changement de zone, dans
- * zoneMap : 0 = dehors, 1 = dans le terrain, 2 = dans la marge. Refaire
- * le test a chaque image coute quatre produits en croix par pixel ; une
- * table de correspondance ne coute qu'une lecture. */
+/* ------------------------------ terrain ------------------------------ *
+ * Quatre coins quelconques, pas un rectangle : la camera voit le terrain
+ * en perspective. zoneMap classe chaque pixel une fois par changement de
+ * terrain : 0 dehors, 1 terrain, 2 marge.                              */
 
 static bool pointInQuad(float px, float py) {
   bool in = false;
@@ -479,7 +460,7 @@ static float distToSegment(float px, float py, float ax, float ay, float bx, flo
 }
 
 static void buildZoneMap() {
-  if (!zoneMap || !grayW) return;
+  if (!zoneMap || !grayW || !grayH) return;
   for (uint16_t y = 0; y < grayH; y++) {
     for (uint16_t x = 0; x < grayW; x++) {
       uint8_t cls = 0;
@@ -499,13 +480,9 @@ static void buildZoneMap() {
   Serial.printf("[ZONE] carte calculee, marge %u px\n", zoneBand);
 }
 
-/* Percentage of pixels that differ from the PREVIOUS frame.
- *
- * This is what drives the event logic, and it has to be inter-frame
- * rather than against the reference: a hand left in the picture keeps a
- * reference comparison permanently high, so the event would never close
- * and the burst would fire again and again. Compared frame to frame, the
- * same motionless hand reads 0% - movement is movement, presence is not. */
+/* Pixels qui different de l'image PRECEDENTE, en %. Compare a la
+ * reference, une main immobile resterait haute et l'evenement ne se
+ * fermerait jamais ; image a image elle lit 0 %. */
 static float interFrameMotion() {
   if (!havePrev) {
     memcpy(prevBuf, lumaBuf, grayLen);
@@ -522,16 +499,9 @@ static float interFrameMotion() {
   return 100.0f * (float)moved / (float)grayLen;
 }
 
-/* Compare to the reference. Fills maskBuf with 0x00 (changed) / 0xFF
- * (unchanged) and returns the percentage of changed pixels. This is the
- * picture the burst carries: it shows the SHAPE of whatever is there. */
-/* Remplit maskBuf, et rien de plus. L'erosion des pixels isoles et le
- * comptage des pixels changes se font dans la page, sur le masque
- * qu'elle recoit de toute facon : c'etait deux passes completes et deux
- * recopies de 76 ko sur la carte, pour une vue qu'on ne regarde que par
- * moments. */
+/* Remplit maskBuf : 0x00 change, 0xFF inchange. */
 static void buildMask() {
-  if (!haveRef) return;
+  if (!haveRef || !maskBuf || !lumaBuf || !refBuf) return;
 
   const uint8_t thr = threshold;
   for (size_t i = 0; i < grayLen; i++) {
@@ -540,9 +510,36 @@ static void buildMask() {
   }
 }
 
-/* ---------------------- encoders ------------------------------------- */
-/* For transfer: plain [count][0|1] pairs, top-down, no markers. A few
- * lines of JavaScript undo it. A still scene is one long white run. */
+/* Retient le pic de l'evenement. Les pourcentages sont rapportes aux
+ * pixels de chaque zone, pas a l'image entiere, pour rester comparables
+ * d'un cadrage a l'autre. */
+static void measureZonePeak() {
+  if (!zoneSet || !zoneMap || !maskBuf) return;
+
+  uint32_t nIn = 0, nBand = 0, totIn = 0, totBand = 0;
+  uint32_t sx = 0, sy = 0;
+  for (size_t i = 0; i < grayLen; i++) {
+    const uint8_t cls = zoneMap[i];
+    if (!cls) continue;
+    if (cls == 1) totIn++; else totBand++;
+    if (maskBuf[i]) continue;                 // 0xFF = inchange
+    if (cls == 1) nIn++; else nBand++;
+    sx += i % grayW;
+    sy += i / grayW;
+  }
+  const float in   = totIn   ? 100.0f * (float)nIn   / (float)totIn   : 0.0f;
+  const float band = totBand ? 100.0f * (float)nBand / (float)totBand : 0.0f;
+  if (in <= peakIn) return;
+
+  peakIn   = in;
+  peakBand = band;
+  const uint32_t n = nIn + nBand;
+  peakCx = n ? (int16_t)(sx / n) : -1;
+  peakCy = n ? (int16_t)(sy / n) : -1;
+}
+
+/* ---------------------- encodage ------------------------------------- */
+/* Paires [longueur][0|1], de haut en bas, sans marqueur. */
 static size_t encodeRuns(const uint8_t* img) {
   size_t o = 0, i = 0;
   while (i < grayLen) {
@@ -559,12 +556,13 @@ static size_t encodeRuns(const uint8_t* img) {
 /* ----------------------------- SD ------------------------------------ */
 static bool initSD() {
   if (!SD_MMC.begin(SD_MOUNT_POINT, SD_ONE_BIT_MODE)) {
-    lastError = "SD mount failed (card inserted? formatted FAT32?)";
-    Serial.println("[SD] mount failed");
+    lastError = "carte SD non montee (inseree ? formatee en FAT32 ?)";
+    Serial.println("[SD] montage impossible");
     return false;
   }
   if (SD_MMC.cardType() == CARD_NONE) {
-    lastError = "No SD card detected";
+    lastError = "aucune carte SD detectee";
+    SD_MMC.end();
     return false;
   }
   Serial.printf("[SD] mounted: %llu MB total, %llu MB used\n",
@@ -573,106 +571,124 @@ static bool initSD() {
   return true;
 }
 
-/* Writes the burst held in PSRAM as one lossless .avi. The burst frames
- * are stored run-length coded for transfer, so they are decoded back to a
- * mask and re-encoded in the AVI's own flavour of RLE. */
-static void writeBurstAvi() {
-  if (!sdReady || !burstCount) return;
-
-  char path[32];
-  for (uint16_t i = 1; i < 10000; i++) {
-    snprintf(path, sizeof(path), "/evt_%04u.avi", i);
-    if (!SD_MMC.exists(path)) break;
+/* Premier nom libre /prefixe_NNNN.suffixe ; false si la serie est pleine,
+ * sinon le dernier nom serait ecrase en silence. */
+static bool freeName(char* out, size_t cap, const char* prefix, const char* suffix) {
+  for (uint16_t i = 1; i <= 9999; i++) {
+    snprintf(out, cap, "/%s_%04u.%s", prefix, i, suffix);
+    if (!SD_MMC.exists(out)) return true;
   }
+  out[0] = 0;
+  return false;
+}
 
-  File f = SD_MMC.open(path, FILE_WRITE);
-  if (!f) { lastError = String("Cannot create ") + path; return; }
-
-  uint8_t hdr[AVI_HEADER_BYTES];
-  buildAviHeader(hdr, grayW, grayH, BURST_FPS, 0, 0, 0);
-  f.write(hdr, AVI_HEADER_BYTES);
-
-  uint8_t* idx = (uint8_t*)ps_malloc(16UL * BURST_FRAMES);
-  if (!idx) { f.close(); lastError = "Out of PSRAM"; return; }
+/* Les JPEG de la rafale vont dans le fichier tels quels. L'entete est
+ * ecrite une seule fois : les tailles sont connues avant d'ecrire. */
+static void writeBurstAvi() {
+  if (!sdReady || !burstCount || !burstBuf) return;
 
   uint32_t movi = 0, maxFrame = 0;
   for (uint8_t k = 0; k < burstCount; k++) {
-    const uint8_t  slot = burstOrder[k];
-    const uint8_t* src  = burstBuf + (size_t)slot * BURST_FRAME_MAX;
-    const uint32_t len  = burstLen[slot];
-    const uint8_t  pad  = (len & 1) ? 1 : 0;      // RIFF chunks are word-aligned
-
-    uint8_t ch[8];
-    tag(ch, "00dc"); w32(ch + 4, len);
-    f.write(ch, 8);
-    f.write(src, len);
-    if (pad) { uint8_t z = 0; f.write(&z, 1); }
-
-    uint8_t* e = idx + 16UL * k;
-    tag(e, "00dc"); w32(e + 4, 0x10); w32(e + 8, 4 + movi); w32(e + 12, len);
-
-    movi += 8 + len + pad;
+    const uint32_t len = burstLen[burstOrder[k]];
+    movi += 8 + len + (len & 1);
     if (len > maxFrame) maxFrame = len;
   }
 
-  uint8_t ih[8];
-  tag(ih, "idx1"); w32(ih + 4, 16UL * burstCount);
-  f.write(ih, 8);
-  f.write(idx, 16UL * burstCount);
+  char path[32];
+  if (!freeName(path, sizeof(path), "evt", "avi")) {
+    lastError = "plus de nom libre pour un evt_NNNN.avi";
+    return;
+  }
+
+  uint8_t* idx = (uint8_t*)ps_malloc(16UL * burstCount);
+  if (!idx) { lastError = "PSRAM insuffisante"; return; }
+
+  File f = SD_MMC.open(path, FILE_WRITE);
+  if (!f) { free(idx); lastError = String("creation impossible : ") + path; return; }
+
+  uint8_t hdr[AVI_HEADER_BYTES];
+  buildAviHeader(hdr, grayW, grayH, BURST_FPS, burstCount, movi, maxFrame);
+  bool ok = f.write(hdr, AVI_HEADER_BYTES) == AVI_HEADER_BYTES;
+
+  uint32_t off = 0;
+  for (uint8_t k = 0; k < burstCount && ok; k++) {
+    const uint8_t  slot = burstOrder[k];
+    const uint8_t* src  = burstBuf + (size_t)slot * BURST_FRAME_MAX;
+    const uint32_t len  = burstLen[slot];
+    const uint8_t  pad  = (len & 1) ? 1 : 0;      // un bloc RIFF est aligne
+
+    uint8_t ch[8];
+    tag(ch, "00dc"); w32(ch + 4, len);
+    ok = f.write(ch, 8) == 8 && f.write(src, len) == len;
+    if (ok && pad) { uint8_t z = 0; ok = f.write(&z, 1) == 1; }
+
+    uint8_t* e = idx + 16UL * k;
+    tag(e, "00dc"); w32(e + 4, 0x10); w32(e + 8, 4 + off); w32(e + 12, len);
+    off += 8 + len + pad;
+  }
+
+  if (ok) {
+    uint8_t ih[8];
+    tag(ih, "idx1"); w32(ih + 4, 16UL * burstCount);
+    ok = f.write(ih, 8) == 8
+      && f.write(idx, 16UL * burstCount) == 16UL * burstCount;
+  }
   f.close();
   free(idx);
 
-  File patch = SD_MMC.open(path, "r+");
-  if (patch) {
-    buildAviHeader(hdr, grayW, grayH, BURST_FPS, burstCount, movi, maxFrame);
-    patch.seek(0);
-    patch.write(hdr, AVI_HEADER_BYTES);
-    patch.close();
+  if (!ok) {
+    SD_MMC.remove(path);
+    lastError = "ecriture SD echouee (carte pleine ?)";
+    Serial.printf("[EVT] %s abandonne, ecriture SD echouee\n", path);
+    return;
   }
-
   strncpy(burstFile, path, sizeof(burstFile) - 1);
-  Serial.printf("[EVT] %s written, %u frames\n", path, burstCount);
+  burstFile[sizeof(burstFile) - 1] = 0;
+  Serial.printf("[EVT] %s ecrit, %u images\n", path, burstCount);
 }
 
-/* ------------------------ raw recording ------------------------------ *
- * File layout, little-endian, 16-byte header then frame after frame:
- *   0  "ESPG"   4 bytes
- *   4  width    uint16
- *   6  height   uint16
- *   8  fps      uint16
- *  10  (unused) uint16
- *  12  frames   uint32   - written as 0, patched when recording stops
- *  16  frame 0, frame 1, ... each width*height bytes of 8-bit grayscale
- * tools/replay.py reads exactly this.                                    */
+/* ------------------------ enregistrement brut ------------------------ *
+ * Entete de 16 octets, little-endian, puis les images bout a bout :
+ *   0  "ESPG"    4 octets
+ *   4  largeur   uint16
+ *   6  hauteur   uint16
+ *   8  images/s  uint16
+ *  10  (inutilise) uint16
+ *  12  images    uint32   - ecrit a 0, corrige a l'arret
+ *  16  image 0, image 1, ... largeur*hauteur octets de gris 8 bits
+ * tools/replay.py lit exactement ceci.                                   */
 static bool startRawRecording() {
   if (recOn) return true;
-  if (!sdReady) { lastError = "SD card not ready"; return false; }
-  if (!grayW)   { lastError = "camera not ready yet"; return false; }
+  if (!sdReady)             { lastError = "carte SD non prete"; return false; }
+  if (!grayW || !grayLen)   { lastError = "camera pas encore prete"; return false; }
 
-  for (uint16_t i = 1; i < 10000; i++) {
-    snprintf(recPath, sizeof(recPath), "/raw_%04u.gray", i);
-    if (!SD_MMC.exists(recPath)) break;
+  if (!freeName(recPath, sizeof(recPath), "raw", "gray")) {
+    lastError = "plus de nom libre pour un raw_NNNN.gray";
+    return false;
   }
   recFile = SD_MMC.open(recPath, FILE_WRITE);
-  if (!recFile) { lastError = String("Cannot create ") + recPath; return false; }
+  if (!recFile) { lastError = String("creation impossible : ") + recPath; return false; }
 
   uint8_t h[16] = {0};
   memcpy(h, REC_MAGIC, 4);
   w16(h + 4, grayW);
   w16(h + 6, grayH);
   w16(h + 8, REC_FPS);
-  w32(h + 12, 0);                      // patched on stop
+  w32(h + 12, 0);                      // corrige a l'arret
   if (recFile.write(h, 16) != 16) {
     recFile.close();
-    lastError = "SD write failed on the header";
+    SD_MMC.remove(recPath);
+    recPath[0] = 0;
+    lastError = "ecriture SD echouee sur l'entete";
     return false;
   }
+  recFile.flush();
 
   recFrames = 0;
   recNextMs = millis();
   recOn = true;
   lastError = "";
-  Serial.printf("[RAW] recording -> %s (%ux%u, %d fps)\n", recPath, grayW, grayH, REC_FPS);
+  Serial.printf("[RAW] enregistre -> %s (%ux%u, %d i/s)\n", recPath, grayW, grayH, REC_FPS);
   return true;
 }
 
@@ -688,22 +704,23 @@ static void stopRawRecording() {
     patch.seek(12);
     patch.write(n, 4);
     patch.close();
+  } else {
+    Serial.println("[RAW] nombre d'images non corrige dans l'entete");
   }
-  Serial.printf("[RAW] stopped: %s, %u frames, %.1f MB\n", recPath, (unsigned)recFrames,
+  Serial.printf("[RAW] arret : %s, %u images, %.1f Mo\n", recPath, (unsigned)recFrames,
                 (16.0 + (double)recFrames * grayLen) / 1048576.0);
 }
 
-/* Writes the frame the detection has just looked at: one grab serves
- * both, so recording costs no extra capture. */
 static void recordRaw() {
   if (!recOn) return;
   const uint32_t now = millis();
   if ((int32_t)(now - recNextMs) < 0) return;
   recNextMs = now + 1000UL / REC_FPS;
 
+  if (!lumaBuf || !grayLen) { stopRawRecording(); return; }
   if (recFile.write(lumaBuf, grayLen) != grayLen) {
-    Serial.println("[RAW] SD write failed - card full?");
-    lastError = "SD write failed (card full?)";
+    lastError = "ecriture SD echouee (carte pleine ?)";
+    Serial.println("[RAW] ecriture SD echouee - carte pleine ?");
     stopRawRecording();
     return;
   }
@@ -711,22 +728,15 @@ static void recordRaw() {
   if ((recFrames & 0x1F) == 0) recFile.flush();
 }
 
-/* ------------------------ detection loop ----------------------------- */
-/* Keeps the most recent PICTURE in the ring, overwriting the oldest.
- *
- * The mask is what decides when something happened; the burst is what you
- * actually look at afterwards, so it holds real camera frames. They are
- * JPEG encoded here and never touched again: the .avi stores these exact
- * bytes, and the page decodes them as ordinary images.
- *
- * Encoding only runs while an event is under way, not while waiting. */
+/* ------------------------ boucle de detection ------------------------ */
 static void ringPush(camera_fb_t* fb) {
+  if (!burstBuf) return;
   uint8_t* jpg = nullptr;
   size_t   len = 0;
   if (!fmt2jpg(fb->buf, fb->len, fb->width, fb->height,
                PIXFORMAT_RGB565, BURST_QUALITY, &jpg, &len)) return;
 
-  if (len <= BURST_FRAME_MAX) {
+  if (len && len <= BURST_FRAME_MAX) {
     memcpy(burstBuf + (size_t)ringPos * BURST_FRAME_MAX, jpg, len);
     burstLen[ringPos] = len;
     ringPos = (ringPos + 1) % BURST_FRAMES;
@@ -735,12 +745,16 @@ static void ringPush(camera_fb_t* fb) {
   free(jpg);
 }
 
-/* Freezes the ring into a burst, oldest frame first. */
-/* Envoie la rafale au serveur en un seul POST. Meme disposition que
-   /burst : [u16 w][u16 h][u8 n] puis [u32 longueur][jpeg] par image. Les
-   mesures voyagent dans l'adresse, le serveur n'a pas a les recalculer. */
+/* Envoie la rafale en un seul POST : [u16 w][u16 h][u8 n] puis
+ * [u32 longueur][jpeg] par image. Les mesures voyagent dans l'adresse. */
 static bool postBurst() {
-  if (!SERVER_URL[0] || !burstCount) return false;
+  if (!SERVER_URL[0] || !burstCount || !burstBuf) return false;
+  /* Sans lien, HTTPClient bloquerait la boucle de detection pendant son
+   * delai de connexion : on tombe tout de suite sur la SD. */
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[CLIP] pas de lien wifi, ecriture SD");
+    return false;
+  }
 
   uint32_t total = 5;
   for (uint8_t k = 0; k < burstCount; k++) total += 4 + burstLen[burstOrder[k]];
@@ -768,6 +782,7 @@ static bool postBurst() {
   HTTPClient http;
   http.setConnectTimeout(2500);
   http.setTimeout(8000);
+  http.setReuse(false);
   bool ok = false;
   if (http.begin(url)) {
     http.addHeader("Content-Type", "application/octet-stream");
@@ -775,6 +790,8 @@ static bool postBurst() {
     ok = (code >= 200 && code < 300);
     Serial.printf("[CLIP] POST %s -> %d (%u o)\n", url, code, (unsigned)total);
     http.end();
+  } else {
+    Serial.printf("[CLIP] adresse de serveur inutilisable : %s\n", url);
   }
   free(body);
   return ok;
@@ -786,22 +803,29 @@ static void closeEvent() {
   for (uint8_t i = 0; i < burstCount; i++)
     burstOrder[i] = (uint8_t)((first + i) % BURST_FRAMES);
 
+  /* Le pic de l'evenement, pas la scene calme qui vient de le fermer. */
+  pctIn = peakIn; pctBand = peakBand;
+  maskCx = peakCx; maskCy = peakCy;
+  peakIn = peakBand = 0.0f;
+  peakCx = peakCy = -1;
+
   evtState = EVT_READY;
   eventCount++;
   rearmLeft = REARM_CYCLES;
-  /* Le serveur d'abord ; sans lui, la carte SD. */
-  if (postBurst()) {
-    lastSendOk = true;
-    burstFile[0] = 0;
-  } else {
+  burstFile[0] = 0;
+  if (burstCount == 0) {
     lastSendOk = false;
-    writeBurstAvi();
+    Serial.println("[EVT] aucune image a envoyer");
+    return;
   }
-  Serial.printf("[EVT] event %u: %.1f s of movement, %u frames kept\n",
-                (unsigned)eventCount, activeMs / 1000.0f, burstCount);
+  lastSendOk = postBurst();             // le serveur d'abord, sinon la SD
+  if (!lastSendOk) writeBurstAvi();
+  Serial.printf("[EVT] evenement %u : %.1f s de mouvement, %u images, pic %.2f %%\n",
+                (unsigned)eventCount, activeMs / 1000.0f, burstCount, pctIn);
 }
 
 static void motionTick() {
+  if (!cameraOk) return;
   const uint32_t now = millis();
   if ((int32_t)(now - nextMotionMs) < 0) return;
   nextMotionMs = now + 1000UL / MOTION_HZ;
@@ -809,38 +833,34 @@ static void motionTick() {
   camera_fb_t* fb = esp_camera_fb_get();
   if (!fb) return;
   if (!ensureBuffers(fb)) { esp_camera_fb_return(fb); return; }
+  if (fb->len < grayLen * 2) {        // trame RGB565 incomplete
+    esp_camera_fb_return(fb);
+    return;
+  }
 
   toLuma(fb);
-  recordRaw();                        // apres toLuma : c'est elle qui remplit lumaBuf
+  recordRaw();                        // apres toLuma, qui remplit lumaBuf
 
-  /* Rafale demandee a la main depuis le serveur. Elle passe avant le
-     garde-fou : forcer un envoi doit marcher sans terrain ni reference,
-     c'est justement ce qui sert a verifier la liaison. */
+  /* Avant le garde-fou : forcer un envoi sert a verifier la liaison sans
+   * rien avoir regle. */
   if (forceLeft) {
     ringPush(fb);
     if (--forceLeft == 0) {
       activeMs = 0;
       closeEvent();
-      Serial.println("[EVT] rafale forcee envoyee");
     }
     esp_camera_fb_return(fb);
     return;
   }
 
-  /* La detection demande deux choses venues du serveur : une reference et
-     un terrain. Sans elles la carte se contente d'enregistrer - c'est le
-     mode degrade voulu, pas une panne, et ca evite de declencher des
-     evenements sur une zone que personne n'a definie. */
+  /* Sans reference ET sans terrain la carte se contente d'enregistrer. */
   if (!haveRef || !zoneSet) {
     esp_camera_fb_return(fb);
     return;
   }
 
-  /* Rolling average over the last few measurements. Frame-to-frame
-   * movement is naturally spiky - a shuttle crossing the frame reads
-   * 10, 20, 0, 10, 30 - and a single stray low reading in the middle of
-   * real movement was enough to start closing the event. Averaging costs
-   * nothing and removes that whole class of false ending. */
+  /* Moyenne glissante : une seule mesure basse au milieu d'un echange
+   * suffisait a commencer a fermer l'evenement. */
   rawPct = interFrameMotion();
   pctHist[pctIndex] = rawPct;
   pctIndex = (pctIndex + 1) % PCT_AVERAGE;
@@ -849,36 +869,40 @@ static void motionTick() {
   for (uint8_t i = 0; i < pctCount; i++) sum += pctHist[i];
   lastPct = sum / pctCount;           // drives the state machine
 
-  /* Le masque ne sert qu'a la vue "regarder" : il est construit quand la
-     page le demande, pas dix fois par seconde pour personne. */
-
   switch (evtState) {
 
     case EVT_ACTIVE:
-      ringPush(fb);                                // keep the movement itself
+      ringPush(fb);                      // garder le mouvement lui-meme
+      buildMask();                       // puis relever le pic par zone
+      measureZonePeak();
       if (lastPct < calmPct) {
         calmRun++;
         if (calmRun >= CALM_CYCLES) {
-          /* The scene has settled. Only call it an event if the movement
-           * lasted long enough - a brief flicker is not one. */
-          activeMs = now - activeStart - CALM_CYCLES * (1000UL / MOTION_HZ);
+          /* Les cycles calmes ayant servi a constater la fin ne font pas
+           * partie du mouvement. */
+          const uint32_t calmMs = CALM_CYCLES * (1000UL / MOTION_HZ);
+          const uint32_t ecoule = now - activeStart;
+          activeMs = ecoule > calmMs ? ecoule - calmMs : 0;
           if (activeMs >= minActiveMs) {
             closeEvent();
           } else {
-            Serial.printf("[EVT] ignored, only %.1f s of movement\n", activeMs / 1000.0f);
-            evtState = EVT_WAITING;
+            Serial.printf("[EVT] ignore, seulement %.1f s de mouvement\n",
+                          activeMs / 1000.0f);
+            evtState  = EVT_WAITING;
             ringCount = ringPos = 0;
+            peakIn = peakBand = 0.0f;
+            peakCx = peakCy = -1;
           }
           calmRun = 0;
         }
       } else {
-        calmRun = 0;                               // still moving
+        calmRun = 0;                     // ca bouge encore
       }
       break;
 
     case EVT_READY:
-      /* Hold the burst until the scene has been calm for a while, so one
-       * long movement cannot produce event after event. */
+      /* Attendre le retour au calme : un seul long mouvement ne doit pas
+       * produire evenement apres evenement. */
       if (lastPct < calmPct) {
         if (rearmLeft) rearmLeft--;
       } else {
@@ -888,7 +912,7 @@ static void motionTick() {
 
     case EVT_WAITING:
     default:
-      if (rearmLeft) {                             // settling after an event
+      if (rearmLeft) {
         if (lastPct < calmPct) rearmLeft--; else rearmLeft = REARM_CYCLES;
         break;
       }
@@ -898,7 +922,9 @@ static void motionTick() {
         calmRun     = 0;
         ringCount   = ringPos = 0;
         burstFile[0] = 0;
-        Serial.printf("[EVT] movement started at %.1f%%\n", lastPct);
+        peakIn = peakBand = 0.0f;
+        peakCx = peakCy = -1;
+        Serial.printf("[EVT] mouvement a %.1f %%\n", lastPct);
         ringPush(fb);
       }
       break;
@@ -912,31 +938,55 @@ static void cors() { server.sendHeader("Access-Control-Allow-Origin", "*"); }
 
 static void handleRoot() { server.send_P(200, "text/html", APP_PAGE); }
 
-/* A few dozen bytes, polled several times a second even on a bad link. */
+/* Les guillemets d'un message d'erreur casseraient le JSON. */
+static void jsonSafe(char* out, size_t cap, const char* in) {
+  size_t o = 0;
+  for (size_t i = 0; in[i] && o + 1 < cap; i++) {
+    const char c = in[i];
+    out[o++] = (c == '"' || c == '\\' || (unsigned char)c < 0x20) ? ' ' : c;
+  }
+  out[o] = 0;
+}
+
 static void handleMotion() {
-  char j[256];
+  char err[96], rp[40], bf[40], srv[112];
+  jsonSafe(err, sizeof(err), lastError.c_str());
+  jsonSafe(rp,  sizeof(rp),  recPath);
+  jsonSafe(bf,  sizeof(bf),  burstFile);
+  jsonSafe(srv, sizeof(srv), SERVER_URL);
+
+  /* Large : srv, recfile, file et err sont des chaines, et un JSON
+   * tronque ferait echouer chaque interrogation de la page. */
+  char j[900];
   snprintf(j, sizeof(j),
-           "{\"ver\":\"" FW_VERSION "\",\"pct\":%.2f,\"rawpct\":%.2f,\"move\":%.2f,\"calm\":%.2f,\"minms\":%u,\"thr\":%u,"
-           "\"ref\":%s,\"lock\":%s,\"state\":%u,\"active\":%u,\"n\":%u,"
-           "\"events\":%u,\"sd\":%s,\"rec\":%s,\"recn\":%u,\"recfile\":\"%s\",\"w\":%u,\"h\":%u,\"file\":\"%s\"}",
+           "{\"ver\":\"" FW_VERSION "\",\"pct\":%.2f,\"rawpct\":%.2f,\"move\":%.2f,"
+           "\"calm\":%.2f,\"minms\":%u,\"thr\":%u,\"ref\":%s,\"lock\":%s,"
+           "\"zone\":%s,\"band\":%u,\"srv\":\"%s\",\"state\":%u,\"active\":%u,"
+           "\"n\":%u,\"events\":%u,\"sent\":%s,\"in\":%.2f,\"band_pct\":%.2f,"
+           "\"cx\":%d,\"cy\":%d,\"cam\":%s,\"sd\":%s,\"rec\":%s,\"recn\":%u,"
+           "\"recfile\":\"%s\",\"w\":%u,\"h\":%u,\"file\":\"%s\",\"err\":\"%s\"}",
            lastPct, rawPct, movePct, calmPct, (unsigned)minActiveMs, (unsigned)threshold,
            haveRef ? "true" : "false",
            exposureLocked ? "true" : "false",
+           zoneSet ? "true" : "false", (unsigned)zoneBand, srv,
            (unsigned)evtState,
            (unsigned)(evtState == EVT_ACTIVE ? (millis() - activeStart) : activeMs),
            (unsigned)burstCount, (unsigned)eventCount,
+           lastSendOk ? "true" : "false",
+           pctIn, pctBand, (int)maskCx, (int)maskCy,
+           cameraOk ? "true" : "false",
            sdReady ? "true" : "false",
-           recOn ? "true" : "false", (unsigned)recFrames, recPath,
-           (unsigned)grayW, (unsigned)grayH, burstFile);
+           recOn ? "true" : "false", (unsigned)recFrames, rp,
+           (unsigned)grayW, (unsigned)grayH, bf, err);
   cors();
   server.send(200, "application/json", j);
 }
 
-/* The whole burst in one response: [u16 w][u16 h][u8 count], then per
- * frame [u32 length][run-length bytes]. One transfer per event instead of
- * a continuous stream. */
+/* [u16 w][u16 h][u8 n] puis [u32 longueur][jpeg] par image. */
 static void handleBurst() {
-  if (evtState != EVT_READY || !burstCount) { cors(); server.send(409, "text/plain", "no burst"); return; }
+  if (evtState != EVT_READY || !burstCount || !burstBuf) {
+    cors(); server.send(409, "text/plain", "aucune rafale"); return;
+  }
 
   uint32_t total = 5;
   for (uint8_t k = 0; k < burstCount; k++) total += 4 + burstLen[burstOrder[k]];
@@ -973,6 +1023,12 @@ static void handleClear() {
   evtState   = EVT_WAITING;
   burstCount = 0;
   ringCount  = ringPos = 0;
+  rearmLeft  = 0;
+  calmRun    = 0;
+  forceLeft  = 0;
+  burstFile[0] = 0;
+  peakIn = peakBand = 0.0f;
+  peakCx = peakCy = -1;
   cors();
   server.send(200, "text/plain", "ok");
 }
@@ -983,31 +1039,40 @@ static void handleReference() {
   server.send(200, "text/plain", "ok");
 }
 
-/* /zone?p=x0,y0,x1,y1,x2,y2,x3,y3&band=40 — les quatre coins dans l'ordre
-   du contour. Sans argument, renvoie la zone courante. */
+/* /zone?p=x0,y0,x1,y1,x2,y2,x3,y3&band=40 : les quatre coins dans l'ordre
+ * du contour. Sans argument, renvoie le terrain courant. */
 static void handleZone() {
   const String p = server.arg("p");
   if (p.length()) {
+    if (!zoneMap || !grayW) {
+      cors();
+      server.send(409, "text/plain", "camera pas encore prete");
+      return;
+    }
     int v[8], n = 0, from = 0;
     while (n < 8) {
       const int c = p.indexOf(',', from);
-      v[n++] = p.substring(from, c < 0 ? p.length() : c).toInt();
+      v[n++] = p.substring(from, c < 0 ? (int)p.length() : c).toInt();
       if (c < 0) break;
       from = c + 1;
     }
-    if (n == 8) {
-      for (int i = 0; i < 4; i++) { zoneX[i] = v[i * 2]; zoneY[i] = v[i * 2 + 1]; }
-      if (server.hasArg("band")) {
-        const int b = server.arg("band").toInt();
-        if (b >= 0 && b <= 500) zoneBand = (uint16_t)b;
-      }
-      zoneSet = true;
-      buildZoneMap();
-    } else {
+    if (n != 8) {
       cors();
       server.send(400, "text/plain", "il faut huit nombres");
       return;
     }
+    /* Des coins hors cadre rendraient buildZoneMap faux sans rien dire. */
+    for (int i = 0; i < 4; i++) {
+      const int x = v[i * 2], y = v[i * 2 + 1];
+      zoneX[i] = (int16_t)(x < 0 ? 0 : (x > grayW - 1 ? grayW - 1 : x));
+      zoneY[i] = (int16_t)(y < 0 ? 0 : (y > grayH - 1 ? grayH - 1 : y));
+    }
+    if (server.hasArg("band")) {
+      const int b = server.arg("band").toInt();
+      if (b >= 0 && b <= 500) zoneBand = (uint16_t)b;
+    }
+    zoneSet = true;
+    buildZoneMap();
   }
   char j[192];
   snprintf(j, sizeof(j),
@@ -1019,11 +1084,13 @@ static void handleZone() {
   server.send(200, "application/json", j);
 }
 
-/* /server?url=http://... — vide pour revenir a l'ecriture SD seule. */
-/* /force?n=10 — capture n images maintenant et les envoie comme une
-   rafale ordinaire. Repond tout de suite : la capture se fait dans la
-   boucle, bloquer le serveur une seconde pour dix images serait inutile. */
+/* /force?n=10 : repond tout de suite, la capture se fait dans la boucle. */
 static void handleForce() {
+  if (!cameraOk || !burstBuf) {
+    cors();
+    server.send(409, "text/plain", "camera pas encore prete");
+    return;
+  }
   int n = server.hasArg("n") ? server.arg("n").toInt() : 10;
   if (n < 1) n = 1;
   if (n > BURST_FRAMES) n = BURST_FRAMES;
@@ -1034,11 +1101,26 @@ static void handleForce() {
   server.send(200, "application/json", String("{\"n\":") + n + "}");
 }
 
+/* /server?url=http://... : vide pour revenir a l'ecriture SD seule. */
 static void handleServer() {
   if (server.hasArg("url")) {
-    const String u = server.arg("url");
+    String u = server.arg("url");
+    u.trim();
+    while (u.endsWith("/")) u.remove(u.length() - 1);
+    /* postBurst colle "/clip" derriere. */
+    if (u.length() && !u.startsWith("http://") && !u.startsWith("https://")) {
+      cors();
+      server.send(400, "text/plain", "adresse attendue sous la forme http://hote:port");
+      return;
+    }
+    if (u.length() > (int)sizeof(SERVER_URL) - 6) {
+      cors();
+      server.send(400, "text/plain", "adresse trop longue");
+      return;
+    }
     strncpy(SERVER_URL, u.c_str(), sizeof(SERVER_URL) - 1);
     SERVER_URL[sizeof(SERVER_URL) - 1] = 0;
+    Serial.printf("[CLIP] serveur : %s\n", SERVER_URL[0] ? SERVER_URL : "(aucun)");
   }
   cors();
   server.send(200, "text/plain", SERVER_URL);
@@ -1058,8 +1140,6 @@ static void handleTrigger() {
   server.send(200, "text/plain", String(movePct, 2));
 }
 
-/* The percentage below which the scene counts as settled: it is what
- * closes an event, so a hand held still never keeps firing. */
 static void handleCalm() {
   const float v = server.arg("v").toFloat();
   if (v >= 0.0f && v <= 100.0f) calmPct = v;
@@ -1067,7 +1147,6 @@ static void handleCalm() {
   server.send(200, "text/plain", String(calmPct, 2));
 }
 
-/* How long the movement must last before it is worth an event. */
 static void handleMinActive() {
   const long v = server.arg("v").toInt();
   if (v >= 0 && v <= 60000) minActiveMs = (uint32_t)v;
@@ -1075,17 +1154,16 @@ static void handleMinActive() {
   server.send(200, "text/plain", String(minActiveMs));
 }
 
-/* Alignment only: one JPEG, software encoded, meant to be asked for
- * rarely. The live picture is never streamed. */
 static void handleSnapshot() {
+  cors();
+  if (!cameraOk) { server.send(409, "text/plain", "camera indisponible"); return; }
   camera_fb_t* fb = esp_camera_fb_get();
-  if (!fb) { server.send(503, "text/plain", "capture failed"); return; }
+  if (!fb) { server.send(503, "text/plain", "capture impossible"); return; }
   uint8_t* jpg = nullptr; size_t len = 0;
   const bool ok = fmt2jpg(fb->buf, fb->len, fb->width, fb->height,
                           PIXFORMAT_RGB565, PREVIEW_QUALITY, &jpg, &len);
   esp_camera_fb_return(fb);
-  if (!ok) { server.send(503, "text/plain", "encode failed"); return; }
-  cors();
+  if (!ok) { server.send(503, "text/plain", "encodage impossible"); return; }
   server.sendHeader("Cache-Control", "no-store");
   server.setContentLength(len);
   server.send(200, "image/jpeg", "");
@@ -1093,20 +1171,16 @@ static void handleSnapshot() {
   free(jpg);
 }
 
-/* The stored reference, as a JPEG. Asked for once after it is taken, so
- * you can see what the comparison is actually based on - a reference
- * caught mid-exposure or with someone still in frame explains far more
- * odd behaviour than any threshold does. */
 static void handleRefImg() {
-  if (!haveRef) { cors(); server.send(409, "text/plain", "no reference"); return; }
+  cors();
+  if (!haveRef || !refBuf) { server.send(409, "text/plain", "aucune reference"); return; }
   uint8_t* jpg = nullptr;
   size_t   len = 0;
   if (!fmt2jpg(refBuf, grayLen, grayW, grayH, PIXFORMAT_GRAYSCALE,
                PREVIEW_QUALITY, &jpg, &len)) {
-    server.send(503, "text/plain", "encode failed");
+    server.send(503, "text/plain", "encodage impossible");
     return;
   }
-  cors();
   server.sendHeader("Cache-Control", "no-store");
   server.setContentLength(len);
   server.send(200, "image/jpeg", "");
@@ -1114,21 +1188,24 @@ static void handleRefImg() {
   free(jpg);
 }
 
-/* The live mask as run-length, for aiming and tuning the threshold.
- * Asked for on demand, never pushed. */
 static void handleMask() {
-  if (!haveRef) { cors(); server.send(409, "text/plain", "no reference"); return; }
+  cors();
+  if (!haveRef) { server.send(409, "text/plain", "aucune reference"); return; }
+  if (!cameraOk) { server.send(409, "text/plain", "camera indisponible"); return; }
   camera_fb_t* fb = esp_camera_fb_get();
-  if (!fb) { server.send(503, "text/plain", "capture failed"); return; }
-  if (!ensureBuffers(fb)) { esp_camera_fb_return(fb); server.send(500, "text/plain", "no memory"); return; }
+  if (!fb) { server.send(503, "text/plain", "capture impossible"); return; }
+  if (!ensureBuffers(fb) || fb->len < grayLen * 2) {
+    esp_camera_fb_return(fb);
+    server.send(500, "text/plain", "trame ou memoire indisponible");
+    return;
+  }
   toLuma(fb);
-  buildMask();              // vue a la demande : ne touche pas au chiffre de mouvement
+  buildMask();              // a la demande : ne touche pas au chiffre de mouvement
   esp_camera_fb_return(fb);
 
   const size_t len = encodeRuns(maskBuf);
   uint8_t head[5];
   w16(head, grayW); w16(head + 2, grayH); head[4] = 1;
-  cors();
   server.setContentLength(5 + len);
   server.send(200, "application/octet-stream", "");
   server.sendContent((const char*)head, 5);
@@ -1148,9 +1225,11 @@ static void handleFiles() {
       String n = f.name();
       if (n.startsWith("/")) n = n.substring(1);
       if (n.endsWith(".avi") || n.endsWith(".gray")) {
-        char row[96];
+        char nom[72];
+        jsonSafe(nom, sizeof(nom), n.c_str());
+        char row[112];
         snprintf(row, sizeof(row), "%s{\"n\":\"%s\",\"s\":%u}",
-                 first ? "" : ",", n.c_str(), (unsigned)f.size());
+                 first ? "" : ",", nom, (unsigned)f.size());
         server.sendContent(row);
         first = false;
       }
@@ -1162,14 +1241,32 @@ static void handleFiles() {
   server.sendContent("");
 }
 
+/* Un nom venu du navigateur ne doit designer qu'un fichier de la racine. */
+static bool sdPathOk(const String& f) {
+  if (!sdReady || f.length() < 2 || f.length() > 63) return false;
+  if (!f.startsWith("/")) return false;
+  if (f.indexOf("..") >= 0) return false;
+  if (f.indexOf('/', 1) >= 0) return false;      // pas de sous-dossier
+  return SD_MMC.exists(f);
+}
+
 static void handleDownload() {
-  String f = server.arg("f");
-  if (!sdReady || !f.startsWith("/") || f.indexOf("..") >= 0 || !SD_MMC.exists(f)) {
-    server.send(404, "text/plain", "not found");
+  const String f = server.arg("f");
+  if (!sdPathOk(f)) {
+    cors();
+    server.send(404, "text/plain", "introuvable");
     return;
   }
   File file = SD_MMC.open(f, FILE_READ);
-  if (!file) { server.send(500, "text/plain", "cannot open"); return; }
+  if (!file) { cors(); server.send(500, "text/plain", "ouverture impossible"); return; }
+  if (recOn && f == String(recPath)) {
+    /* Le fichier grandit pendant la lecture : la taille annoncee serait
+     * fausse et le telechargement tronque. */
+    file.close();
+    cors();
+    server.send(409, "text/plain", "enregistrement en cours sur ce fichier");
+    return;
+  }
 
   const size_t total = file.size();
   server.sendHeader("Content-Disposition", "attachment; filename=" + f.substring(1));
@@ -1199,16 +1296,18 @@ static void handleDownload() {
 }
 
 static void handleDelete() {
-  String f = server.arg("f");
-  if (sdReady && f.startsWith("/") && f.indexOf("..") < 0 && SD_MMC.exists(f)) SD_MMC.remove(f);
+  const String f = server.arg("f");
   cors();
-  server.send(200, "text/plain", "ok");
+  if (!sdPathOk(f)) { server.send(404, "text/plain", "introuvable"); return; }
+  if (recOn && f == String(recPath)) {
+    server.send(409, "text/plain", "enregistrement en cours sur ce fichier");
+    return;
+  }
+  server.send(200, "text/plain", SD_MMC.remove(f) ? "ok" : "suppression impossible");
 }
 
-/* ----------------------------- setup --------------------------------- */
-/* Le hotspot redistribue un bail different a chaque redemarrage, donc
-   l'adresse notee dans la page devient fausse. Le nom, lui, ne change
-   pas : http://esp32cam.local */
+/* ----------------------------- demarrage ----------------------------- */
+/* Le bail DHCP change a chaque redemarrage, le nom non. */
 static void announceMdns() {
   static bool mdnsUp = false;
   if (mdnsUp) return;
@@ -1224,12 +1323,23 @@ static void announceMdns() {
 void setup() {
   Serial.begin(115200);
   delay(300);
-  Serial.println("\n[BOOT] ESP32-WROVER change detector");
+  Serial.println("\n[BOOT] detecteur de changement ESP32-WROVER " FW_VERSION);
 
-  if (!psramFound()) Serial.println("[BOOT] WARNING: no PSRAM detected");
-  if (!initCamera()) {
-    Serial.println("[BOOT] camera init failed - halting");
-    while (true) delay(1000);
+  if (!psramFound()) Serial.println("[BOOT] ATTENTION : pas de PSRAM detectee");
+
+  /* L'init echoue parfois au premier essai apres une coupure brutale. */
+  for (int essai = 1; essai <= 3 && !cameraOk; essai++) {
+    cameraOk = initCamera();
+    if (!cameraOk) {
+      Serial.printf("[CAM] essai %d/3 echoue\n", essai);
+      esp_camera_deinit();
+      delay(500);
+    }
+  }
+  if (!cameraOk) {
+    /* Ne pas bloquer : sans serveur web on ne peut pas lire la panne. */
+    lastError = "initialisation camera impossible";
+    Serial.println("[BOOT] camera indisponible - le serveur web demarre quand meme");
   }
   sdReady = initSD();
 
@@ -1260,18 +1370,15 @@ void setup() {
   Serial.println();
   staLastTry = millis();
   if (WiFi.status() == WL_CONNECTED) {
-    esp_wifi_set_ps(WIFI_PS_NONE);     // must be after association to stick
-    wifi_ps_type_t ps = WIFI_PS_NONE;
-    esp_wifi_get_ps(&ps);
-    Serial.print("[WIFI] open http://");
+    esp_wifi_set_ps(WIFI_PS_NONE);     // apres l'association, sinon sans effet
+    Serial.print("[WIFI] ouvrir http://");
     Serial.println(WiFi.localIP());
     announceMdns();
     staWasUp = true;
-    Serial.printf("[WIFI] RSSI %d dBm, ps=%d (0 = none)\n", WiFi.RSSI(), (int)ps);
+    Serial.printf("[WIFI] RSSI %d dBm\n", WiFi.RSSI());
   } else {
-    /* Le driver continue d'essayer en arriere-plan apres notre timeout :
-       sans cet arret, la tentative suivante se superpose et le driver
-       repond "sta is connecting, return error". */
+    /* Sans cet arret, la tentative suivante se superpose et le driver
+     * repond "sta is connecting, return error". */
     WiFi.disconnect(false);
     Serial.printf("[WIFI] %s injoignable - nouvelle tentative toutes les %u s\n",
                   WIFI_SSID, (unsigned)(STA_RETRY_MS / 1000));
@@ -1297,9 +1404,9 @@ void setup() {
   server.on("/files",     handleFiles);
   server.on("/download",  handleDownload);
   server.on("/delete",    handleDelete);
-  server.onNotFound([]() { server.send(404, "text/plain", "404"); });
+  server.onNotFound([]() { cors(); server.send(404, "text/plain", "404"); });
   server.begin();
-  Serial.println("[HTTP] server started on port 80");
+  Serial.println("[HTTP] serveur demarre sur le port 80");
 }
 
 void loop() {
@@ -1307,14 +1414,9 @@ void loop() {
   motionTick();
 
 #if !AP_ONLY
-  /* Reessayer sans jamais abandonner : le hotspot du telephone est
-     souvent allume APRES la carte, et Android le coupe tout seul quand
-     plus aucun client n'est connecte. On espace les tentatives (chacune
-     fait scanner la radio, partagee avec l'AP quand celui-ci tourne) et
-     on ne relance jamais avant la fin de l'intervalle. WL_IDLE_STATUS
-     compte comme "pas connecte" : c'est l'etat annonce par le driver
-     apres une deconnexion, et l'ignorer laissait la station endormie
-     pour de bon. */
+  /* Le hotspot est souvent allume APRES la carte, et Android le coupe
+   * quand plus aucun client n'est connecte. Tentatives espacees : chacune
+   * fait scanner la radio, partagee avec la camera. */
   if (WiFi.status() == WL_CONNECTED) {
     if (!staWasUp) {
       staWasUp = true;

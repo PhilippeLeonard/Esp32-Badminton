@@ -15,6 +15,10 @@ android-app/
 
 # Etat du match tenu par serveur.py
 match.json
+match.json.tmp
+
+# Derniere adresse de carte retenue par demarrer.py
+carte.json
 
 # clips recus par le serveur
 clips/
