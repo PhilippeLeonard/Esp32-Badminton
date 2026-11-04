@@ -12,8 +12,10 @@ dégradé voulu en prototype, pas une panne.
 ## Disposition du dépôt
 
 ```
-esp32_cam_simple/
-    esp32_cam_simple.ino     la version simple (photo + enregistrement)
+demarrer.py                  tout démarrer d'un coup  <-- commencer ici
+demarrer.bat                 double-clic (Windows)
+demarrer.command             double-clic (macOS)
+demarrer.sh                  double-clic (Linux)
 esp32_cam_recorder/
     esp32_cam_recorder.ino   le firmware  <-- ouvrir CE dossier dans l'IDE
     app_page.h               généré, ne pas éditer à la main
@@ -21,6 +23,8 @@ phone_app.html               la page servie par la carte (source à modifier)
 make_page.py                 phone_app.html  ->  esp32_cam_recorder/app_page.h
 serveur.py                   le serveur : score, terrain, réception des rafales
 score_app.html               la page du serveur
+esp32_cam_simple/
+    esp32_cam_simple.ino     croquis à part, indépendant du détecteur
 tools/replay.py              rejoue la détection sur un enregistrement .gray
 tools/rgb_tool.py            convertit les .rgb et .mjpg en AVI lisible
 ```
@@ -32,35 +36,72 @@ on finit par éditer un fichier pendant qu'on en flashe un autre.
 
 ## Mise en route
 
-1. `python serveur.py --port 8000` sur le PC, puis ouvrir sa page.
-2. Dans **Terrain et référence** : saisir l'adresse de la carte.
-3. **Prendre la référence sur la carte** — scène au repos, l'exposition
+Alimenter la carte, puis **un seul geste** sur le PC :
+
+| système | quoi faire |
+| --- | --- |
+| Windows | double-clic sur `demarrer.bat` |
+| macOS | double-clic sur `demarrer.command` |
+| Linux | double-clic sur `demarrer.sh`, ou `python3 demarrer.py` |
+
+`demarrer.py` enchaîne tout ce qu'il fallait faire à la main :
+
+1. régénère `app_page.h` si `phone_app.html` a changé ;
+2. lance `serveur.py` sur un port libre ;
+3. **trouve la carte** — nom mDNS `esp32cam.local`, puis la dernière
+   adresse connue, puis `192.168.4.1`, puis un balayage du réseau local —
+   et lui dit où poster ses rafales ;
+4. ouvre la page du serveur dans le navigateur.
+
+Ctrl+C arrête le serveur. Options utiles :
+
+```bash
+python demarrer.py --carte 192.168.1.57   # adresse connue, pas de recherche
+```
+
+```bash
+python demarrer.py --port 9000 --sans-navigateur
+```
+
+Il reste **deux choses à faire sur la page**, celles qui demandent de
+regarder l'image, dans le volet *Terrain et référence* :
+
+1. **Prendre la référence sur la carte** — scène au repos, l'exposition
    se verrouille et huit images sont moyennées.
-4. Cliquer les **quatre coins** du terrain sur l'image affichée, régler
+2. Cliquer les **quatre coins** du terrain sur l'image affichée, régler
    la marge, puis **Envoyer le terrain à la carte**.
-5. Indiquer à la carte où poster ses rafales :
-   `http://ADRESSE_CARTE/server?url=http://ADRESSE_PC:8000`
 
-Le terrain se trace sur le PC parce que cliquer quatre points sur une
-image figée n'y coûte rien, alors que le faire depuis la page servie par
-l'ESP32 passait par une liaison lente pour rien. La carte ne reçoit que
-huit nombres.
+Tant que la référence **et** le terrain ne sont pas définis, la carte
+n'envoie rien : la page le rappelle sous les boutons.
 
-Tant que la référence **et** le terrain ne sont pas tous les deux
-définis, la carte ne déclenche aucun événement : rien ne sert de guetter
-un mouvement dans une zone que personne n'a tracée.
+### À la main, sans `demarrer.py`
+
+```bash
+python make_page.py              # si phone_app.html a changé
+python serveur.py --port 8000
+```
+
+puis, dans la page, saisir l'adresse de la carte et cliquer
+**1 · Relier la carte à ce serveur** (ce que fait sinon `demarrer.py`).
+
+Le terrain se trace sur le PC : la carte ne reçoit que huit nombres.
 
 ### Quand un événement se ferme
 
 Les vingt dernières images partent en un seul `POST /clip`, avec les
 mesures dans l'adresse — pourcentages dans le terrain et dans la marge,
-centre des pixels changés, durée. **Si le POST échoue, la rafale est
-écrite sur la carte SD** : un événement ne se perd pas parce que le PC
-est éteint.
+centre des pixels changés, durée. Ces mesures sont celles du **pic** de
+l'événement, pas celles de la scène calme qui vient de le fermer.
 
-Le serveur range le clip dans `clips/` et, s'il est brut, en sort le pic
-de changement et son centre — c'est ce centre qui situe l'impact. Un
-clip JPEG est stocké sans être analysé : le décoder demanderait Pillow.
+**Si le POST échoue, la rafale est écrite sur la carte SD** : un
+événement ne se perd pas parce que le PC est éteint. La carte ne tente
+même pas le POST quand le wifi est tombé, pour ne pas bloquer la
+détection pendant le délai de connexion.
+
+Le serveur range le clip dans `clips/` et écrit à côté un `.avi` qu'un
+lecteur ouvre directement. S'il est brut, il en sort aussi le pic de
+changement et son centre. Un clip JPEG est stocké sans être analysé : le
+décoder demanderait Pillow.
 
 ## Modifier l'interface
 
@@ -78,17 +119,32 @@ droite : les deux versions ne correspondent pas.
 - PSRAM : **Enabled** (obligatoire, les tampons vivent en PSRAM)
 - Partition Scheme : **Huge APP (3MB No OTA)**
 
-## Utilisation
+## Les deux pages
 
-1. Ouvrir `http://192.168.4.1/` (téléphone connecté au Wi-Fi `ESP32-CAM`,
-   mot de passe `camera123`), ou l'adresse affichée sur le port série si
-   la carte a rejoint le hotspot.
-2. Scène au repos → **Prendre la référence** : l'exposition se verrouille
-   et huit images sont moyennées.
-3. **Voir le masque** pour régler la sensibilité par pixel.
-4. Un événement se déclenche sur une *séquence* : du mouvement soutenu
-   pendant au moins la durée minimale, **puis** un retour au calme. Une
-   personne immobile dans le champ ne déclenche donc rien.
+Il y a **deux** pages, et elles ne servent pas à la même chose.
+
+| page | adresse | à quoi elle sert |
+| --- | --- | --- |
+| serveur | `http://ADRESSE_PC:8000/` | score, terrain, référence, réglages, clips reçus |
+| carte | `http://esp32cam.local/` | photo de cadrage, enregistrement brut, fichiers de la carte SD |
+
+Tout ce qui se règle se règle sur la page du **serveur** ; la page servie
+par la carte est le mode sans serveur et ne configure rien. Les garder
+toutes les deux configurables invitait à régler des deux côtés sans
+savoir lequel fait foi.
+
+La carte est joignable par `http://esp32cam.local/` (nom mDNS, stable) ou
+par l'adresse affichée sur le port série. `AP_ENABLED 1` ajoute son
+propre Wi-Fi `ESP32-CAM` / `camera123` sur `http://192.168.4.1/`, au prix
+du canal : l'AP suit alors le hotspot et éjecte le téléphone déjà
+connecté.
+
+## Ce qui déclenche un événement
+
+Une *séquence* : du mouvement soutenu pendant au moins la durée minimale,
+**puis** un retour au calme. Une personne immobile dans le champ ne
+déclenche donc rien — la mesure est prise d'une image à la suivante, pas
+contre la référence, donc une présence immobile lit 0 %.
 
 ## Enregistrement brut
 

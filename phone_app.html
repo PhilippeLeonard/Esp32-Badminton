@@ -44,16 +44,14 @@
 <table id="ft"></table>
 
 <script>
-/* ===================================================================
- *  Cette page est le mode sans serveur : prendre une image, enregistrer
- *  du brut, recuperer les fichiers. Rien d'autre.
- *
- *  Le terrain et les reglages de detection se definissent sur la page du
- *  serveur, qui les pousse ensuite a la carte. Les garder aussi ici
- *  invitait a configurer des deux cotes sans savoir lequel fait foi.
- * =================================================================== */
+/* Mode sans serveur : prendre une image, enregistrer du brut, recuperer
+ * les fichiers. Le terrain et les reglages se definissent sur la page du
+ * serveur, qui les pousse a la carte. */
 
-const APP_VERSION = "2.0.0";
+/* Doit valoir FW_VERSION du croquis : la page compare les deux et signale
+   en haut a droite qu'elle ne vient pas du firmware qui tourne. Les faire
+   differer allumait l'avertissement en permanence. */
+const APP_VERSION = "1.3.0";
 const $ = i => document.getElementById(i);
 $("ver").textContent = "v" + APP_VERSION;
 
