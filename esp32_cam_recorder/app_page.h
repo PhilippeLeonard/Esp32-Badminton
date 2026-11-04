@@ -95,10 +95,7 @@ static const char APP_PAGE[] PROGMEM = R"HTML(<!doctype html>
   <button id="look" class="sec">Voir le masque</button>
 </div>
 
-<button id="zone" class="sec">Definir le terrain (4 coins)</button>
-<div class="st" id="zst">aucun terrain defini</div>
-<div class="st">Marge autour du terrain : <span id="bv">40</span> px</div>
-<input id="band" type="range" min="0" max="150" value="40">
+<div class="st" id="zst">terrain non defini</div>
 
 <div id="refWrap" style="display:none">
   <div class="st">Image de reference &mdash; tout est compare a celle-ci</div>
@@ -369,7 +366,6 @@ function play() {
   playTimer = setInterval(() => {
     ctx.drawImage(burst.bitmaps[k], 0, 0, cv.width, cv.height);
     drawZone();
-    drawZone();
     $("bstat").textContent = "image " + (k+1) + "/" + burst.bitmaps.length;
     if (++k >= burst.bitmaps.length) {
       clearInterval(playTimer);
@@ -462,12 +458,11 @@ setInterval(() => {
   if (running && Date.now() - lastOkMs > 2000) setConnected(false);
 }, 1000);
 
-/* ---------------- selection du terrain ----------------
- * Quatre clics sur l'image figee. Les points sont en coordonnees du
- * canvas, donc deja dans le repere de l'image : c'est ce que la carte
- * attend. Le canvas est affiche plus large qu'il n'est, d'ou la mise a
- * l'echelle par le rapport entre taille affichee et taille reelle. */
-let zoneMode = false, pts = [], zoneData = null;
+/* ---------------- terrain ----------------
+ * Le trace se fait sur la page du serveur : cliquer quatre coins sur un
+ * PC est instantane, le faire ici passait par la liaison lente de la
+ * carte. On se contente d'afficher la limite recue. */
+let zoneData = null;
 
 function drawZone() {
   if (!zoneData || !zoneData.set) return;
@@ -481,60 +476,15 @@ function drawZone() {
   ctx.restore();
 }
 
-cv.addEventListener("click", async e => {
-  if (!zoneMode) return;
-  const r = cv.getBoundingClientRect();
-  pts.push([Math.round((e.clientX - r.left) * cv.width / r.width),
-            Math.round((e.clientY - r.top) * cv.height / r.height)]);
-  ctx.fillStyle = "#e67e22";
-  ctx.fillRect(pts[pts.length-1][0] - 3, pts[pts.length-1][1] - 3, 7, 7);
-  $("zst").textContent = pts.length + "/4 coins";
-  if (pts.length === 4) {
-    zoneMode = false;
-    $("zone").textContent = "Definir le terrain (4 coins)";
-    $("zone").className = "sec";
-    const q = pts.map(a => a.join(",")).join(",");
-    try {
-      await fetch(url("/zone?p=" + q + "&band=" + $("band").value));
-      await loadZone();
-    } catch (err) { $("err").textContent = err.message; }
-  }
-});
-
 async function loadZone() {
   try { zoneData = await (await fetch(url("/zone"))).json(); } catch (e) { return; }
-  $("band").value = zoneData.band;
-  $("bv").textContent = zoneData.band;
   $("zst").textContent = zoneData.set
     ? "terrain defini, marge " + zoneData.band + " px"
-    : "aucun terrain defini";
+    : "terrain non defini - a tracer depuis la page du serveur";
 }
 
-$("zone").onclick = async () => {
-  if (zoneMode) { zoneMode = false; pts = []; $("zone").textContent = "Definir le terrain (4 coins)"; $("zone").className = "sec"; return; }
-  /* On fige une image : cliquer sur un masque qui bouge ne permet pas de
-     viser les lignes du terrain. */
-  try {
-    const r = await fetch(url("/snapshot?t=" + Date.now()));
-    const bmp = await createImageBitmap(await r.blob());
-    cv.width = bmp.width; cv.height = bmp.height;
-    ctx.drawImage(bmp, 0, 0);
-    bmp.close();
-  } catch (e) { $("err").textContent = "image indisponible"; return; }
-  zoneMode = true; pts = [];
-  $("zone").textContent = "Clique les 4 coins (annuler)";
-  $("zone").className = "on";
-  $("zst").textContent = "0/4 coins";
-};
-
-$("band").oninput  = () => { $("bv").textContent = $("band").value; };
-$("band").onchange = async () => {
-  if (!zoneData || !zoneData.set) return;
-  await fetch(url("/zone?p=" + zoneData.p.join(",") + "&band=" + $("band").value));
-  loadZone();
-};
-
 loadZone();
+setInterval(loadZone, 5000);
 setInterval(poll, 350);
 start();
 </script>
