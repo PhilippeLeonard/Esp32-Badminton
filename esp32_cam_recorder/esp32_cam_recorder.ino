@@ -295,12 +295,46 @@ static void lockExposure(bool on) {
   if (on) {
     const int ae = s->status.aec_value;
     const int ag = s->status.agc_gain;
+
+    /* Le capteur ne rapporte pas toujours une exposition exploitable.
+       La reimposer telle quelle quand elle vaut 0 coupe le temps de pose
+       et l'image devient entierement noire : c'est ce qui rendait les
+       enregistrements noirs a partir de la prise de reference. */
+    if (ae <= 0) {
+      Serial.println("[CAM] exposition illisible, on reste en automatique");
+      exposureLocked = false;
+      return;
+    }
+
     s->set_exposure_ctrl(s, 0);
     s->set_gain_ctrl(s, 0);
     s->set_whitebal(s, 0);
     s->set_awb_gain(s, 0);
     s->set_aec_value(s, ae);
     s->set_agc_gain(s, ag);
+
+    /* Verification : si l'image est noire apres verrouillage, on rend la
+       main a l'automatique plutot que d'enregistrer du vide. */
+    delay(120);
+    camera_fb_t* fb = esp_camera_fb_get();
+    if (fb) {
+      uint32_t sum = 0;
+      const size_t step = fb->len > 4096 ? fb->len / 4096 : 1;
+      size_t n = 0;
+      for (size_t i = 0; i < fb->len; i += step) { sum += fb->buf[i]; n++; }
+      const uint32_t moy = n ? sum / n : 0;
+      esp_camera_fb_return(fb);
+      if (moy < 8) {
+        Serial.printf("[CAM] image noire apres verrouillage (moy=%u), retour auto\n",
+                      (unsigned)moy);
+        s->set_exposure_ctrl(s, 1);
+        s->set_gain_ctrl(s, 1);
+        s->set_whitebal(s, 1);
+        s->set_awb_gain(s, 1);
+        exposureLocked = false;
+        return;
+      }
+    }
     Serial.printf("[CAM] exposure locked (aec=%d gain=%d)\n", ae, ag);
   } else {
     s->set_exposure_ctrl(s, 1);
